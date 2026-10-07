@@ -209,10 +209,16 @@ def listar_dispositivos() -> list[dict]:
     Lista TODOS os adaptadores do Windows via Get-NetAdapter.
     Retorna uma lista de dicionarios com campos padronizados.
     """
+    # Status e um enum NET_IF_OPER_STATUS; converte para string para
+    # evitar vir vazio no JSON em alguns builds do Windows.
     script = (
-        "Get-NetAdapter -IncludeHidden | "
-        "Select-Object Name,InterfaceDescription,Status,MacAddress,"
-        "LinkSpeed,ifIndex,DeviceID,MediaType | "
+        "Get-NetAdapter -IncludeHidden | Select-Object Name,"
+        "InterfaceDescription,"
+        "@{Name='Status';Expression={[string]$_.Status}},"
+        "@{Name='AdminStatus';Expression={[string]$_.AdminStatus}},"
+        "@{Name='MediaConnectionState';Expression={[string]"
+        "$_.MediaConnectionState}},"
+        "MacAddress,LinkSpeed,ifIndex,DeviceID,MediaType | "
         "ConvertTo-Json -Depth 3 -Compress"
     )
     raw = _run_powershell(script)
@@ -231,11 +237,21 @@ def listar_dispositivos() -> list[dict]:
 
     adapters: list[dict] = []
     for i, item in enumerate(data, start=1):
+        status = item.get("Status") or ""
+        # Fallback para quando Status vem vazio: usa MediaConnectionState
+        # (Connected / Disconnected / Unknown) ou AdminStatus (Up/Down).
+        if not status.strip():
+            mcs = item.get("MediaConnectionState") or ""
+            admin = item.get("AdminStatus") or ""
+            if mcs.strip():
+                status = mcs
+            elif admin.strip():
+                status = admin
         adapters.append({
             "id": i,
             "name": item.get("Name") or "",
             "description": item.get("InterfaceDescription") or "",
-            "status": item.get("Status") or "",
+            "status": status,
             "mac": (item.get("MacAddress") or "").replace("-", ":").lower(),
             "linkspeed": item.get("LinkSpeed") or "",
             "ifindex": item.get("ifIndex") or 0,

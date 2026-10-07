@@ -74,7 +74,10 @@ echo ============================================================
 echo.
 
 if "%~1"=="" (
-    python ethkeepalive.py --anti-idle --lock-nic
+    REM Defaults recomendados: adaptativo + lock-nic + raw-only + fast
+    REM --fast  = interval 0.5s, jitter 0.15, burst 3, modo aggressive
+    REM --raw-only = so Scapy sendp, nao depende de IPv4 na NIC
+    python ethkeepalive.py --anti-idle --lock-nic --raw-only --fast
 ) else (
     python ethkeepalive.py %*
 )
