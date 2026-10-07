@@ -1338,28 +1338,47 @@ class AdaptiveKeepAlive:
                 self.current_interval = self.base_interval
 
             kind = self._next_test()
-            try:
-                if kind == "icmp":
-                    self._test_icmp()
-                elif kind == "tcp":
-                    self._test_tcp()
-                elif kind == "http_get":
-                    self._http_request("GET")
-                elif kind == "http_head":
-                    self._http_request("HEAD")
-                elif kind == "http_post":
-                    self._http_request("POST")
-                elif kind == "arp":
-                    self._test_arp()
-                elif kind == "raw_icmp":
-                    self._raw_icmp()
-                elif kind == "raw_tcp_http":
-                    self._raw_tcp_http()
-                elif kind == "raw_udp":
-                    self._raw_udp()
-            except Exception as e:  # noqa: BLE001
-                STATS["errors"] += 1
-                log(f"Erro inesperado no ciclo {kind}: {e}", logging.ERROR)
+            # Burst: repete a operacao do ciclo N vezes com pequena
+            # pausa entre os pacotes, para parecer uma rajada real
+            # (ex.: handshake + requisicao + resposta + close).
+            # Burst so faz sentido nos testes raw (fire-and-forget);
+            # testes com socket (TCP connect, HTTP via socket) sao mais
+            # pesados, usamos burst=1 para eles.
+            burst_total = int(getattr(self.args, "burst", 1))
+            if kind in ("tcp", "http_get", "http_head", "http_post"):
+                burst = 1  # sockets Windows nao se beneficiam de burst
+            else:
+                burst = max(1, min(20, burst_total))
+
+            for b in range(burst):
+                if STOP_EVENT.is_set():
+                    break
+                try:
+                    if kind == "icmp":
+                        self._test_icmp()
+                    elif kind == "tcp":
+                        self._test_tcp()
+                    elif kind == "http_get":
+                        self._http_request("GET")
+                    elif kind == "http_head":
+                        self._http_request("HEAD")
+                    elif kind == "http_post":
+                        self._http_request("POST")
+                    elif kind == "arp":
+                        self._test_arp()
+                    elif kind == "raw_icmp":
+                        self._raw_icmp()
+                    elif kind == "raw_tcp_http":
+                        self._raw_tcp_http()
+                    elif kind == "raw_udp":
+                        self._raw_udp()
+                except Exception as e:  # noqa: BLE001
+                    STATS["errors"] += 1
+                    log(f"Erro inesperado no ciclo {kind}: {e}",
+                        logging.ERROR)
+                # Pequena pausa entre pacotes do mesmo burst
+                if b < burst - 1:
+                    STOP_EVENT.wait(random.uniform(0.03, 0.12))
 
             # Modo aggressive: encurta temporariamente quando ha silencio util
             if self.mode == "aggressive":
@@ -1442,14 +1461,78 @@ def _ps_bool_arg(v: Any) -> str:
     return "Disabled"
 
 
+NIC_CLASS_GUID = "{4d36e972-e325-11ce-bfc1-08002be10318}"
+
+
+def _localizar_class_regpath(adapter_name: str) -> str | None:
+    """
+    Encontra 'HKLM:\\...\\Control\\Class\\{4d36...}\\NNNN' do adaptador,
+    cruzando com NetCfgInstanceId == InterfaceGuid.
+    """
+    guid = _ler_interface_guid(adapter_name)
+    if not guid:
+        return None
+    guid_esc = guid.replace("'", "''")
+    script = (
+        f"try {{ (Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\"
+        f"Control\\Class\\{NIC_CLASS_GUID}' -ErrorAction Stop | "
+        f"Where-Object {{ "
+        f"(Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue)"
+        f".NetCfgInstanceId -eq '{guid_esc}' }} | "
+        f"Select-Object -First 1).PsPath }} catch {{ '' }}"
+    )
+    raw = _run_powershell(script).strip()
+    # PsPath volta como 'Microsoft.PowerShell.Core\\Registry::HKEY_LOCAL_MACHINE\\...'
+    if "::" in raw:
+        raw = raw.split("::", 1)[1]
+    return raw or None
+
+
+def _ler_pnp_capabilities(regpath: str) -> int | None:
+    """Le PnPCapabilities DWORD da chave de registro Class da NIC."""
+    reg_esc = regpath.replace("'", "''")
+    script = (
+        f"try {{ (Get-ItemProperty 'Registry::{reg_esc}' "
+        f"-Name PnPCapabilities -ErrorAction Stop).PnPCapabilities "
+        f"}} catch {{ '' }}"
+    )
+    raw = _run_powershell(script).strip()
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _escrever_pnp_capabilities(regpath: str, valor: int) -> bool:
+    """Grava PnPCapabilities=<valor> (DWORD) na chave Class."""
+    reg_esc = regpath.replace("'", "''")
+    script = (
+        f"try {{ New-ItemProperty 'Registry::{reg_esc}' "
+        f"-Name PnPCapabilities -Value {int(valor)} "
+        f"-PropertyType DWord -Force -ErrorAction Stop | Out-Null; "
+        f"'OK' }} catch {{ $_.Exception.Message }}"
+    )
+    out = _run_powershell(script).strip()
+    return out == "OK"
+
+
 def bloquear_nic(adapter_name: str) -> dict:
     """
     Tenta impedir que o Windows desligue/bloqueie o adaptador enquanto
     o programa estiver rodando. Devolve snapshot do estado original.
 
-    Acoes:
-      - Set-NetAdapterPowerManagement -AllowComputerToTurnOffDevice Disabled
-      - Enable-NetAdapter se estiver Disabled (so se possivel)
+    Estrategia em cascata:
+      1) Set-NetAdapterPowerManagement -AllowComputerToTurnOffDevice Disabled
+         (NDIS - preferido quando o driver expoe PM).
+      2) Fallback via registro: PnPCapabilities = 0x18 (24) na chave
+         Class da NIC. Esse bit faz o Windows nao oferecer a opcao
+         'Allow the computer to turn off this device'. Mudanca so toma
+         efeito apos re-enumeracao do dispositivo (reboot ou
+         Disable/Enable; o programa NAO desabilita a NIC - isso cortaria
+         o keep-alive).
+      3) Enable-NetAdapter se estiver Disabled.
 
     NAO ha garantia absoluta: GPO, drivers OEM, politicas de bateria
     (quando em modo de energia agressivo) e Mobility Center podem
@@ -1460,7 +1543,9 @@ def bloquear_nic(adapter_name: str) -> dict:
     if not is_windows():
         return snapshot
 
+    # Caminho 1: Set-NetAdapterPowerManagement
     pm = obter_power_management(adapter_name)
+    pm_cmdlet_used = False
     if pm:
         snapshot["pm"] = pm
         allow = str(pm.get("AllowComputerToTurnOffDevice", "")).lower()
@@ -1477,10 +1562,41 @@ def bloquear_nic(adapter_name: str) -> dict:
                 log(f"[NIC-LOCK] AllowComputerToTurnOffDevice=Disabled "
                     f"em '{adapter_name}'.")
                 snapshot["pm_modified"] = True
+                pm_cmdlet_used = True
             else:
-                log(f"[NIC-LOCK] Falha ao alterar PowerManagement: {out}",
-                    logging.WARNING)
+                log(f"[NIC-LOCK] Falha ao alterar PowerManagement via "
+                    f"cmdlet: {out}", logging.WARNING)
+    else:
+        log(f"[NIC-LOCK] Get-NetAdapterPowerManagement nao retornou "
+            f"nada - cmdlet NDIS nao se aplica. Tentando fallback por "
+            f"registro (PnPCapabilities).")
 
+    # Caminho 2: fallback via registro (PnPCapabilities)
+    if not pm_cmdlet_used:
+        regpath = _localizar_class_regpath(adapter_name)
+        if regpath:
+            snapshot["pnp_regpath"] = regpath
+            orig = _ler_pnp_capabilities(regpath)
+            snapshot["pnp_capabilities_orig"] = orig
+            desejado = 0x18  # bits: no-sleep + no-wake
+            if orig != desejado:
+                if _escrever_pnp_capabilities(regpath, desejado):
+                    log(f"[NIC-LOCK] PnPCapabilities=0x18 gravado em "
+                        f"{regpath}. (Efetivo apos re-enumeracao do "
+                        f"dispositivo; nao desabilitamos a NIC agora "
+                        f"para nao cortar o keep-alive.)")
+                    snapshot["pnp_capabilities_modified"] = True
+                else:
+                    log("[NIC-LOCK] Falha ao gravar PnPCapabilities. "
+                        "Verifique privilegios de Administrador.",
+                        logging.WARNING)
+            else:
+                log("[NIC-LOCK] PnPCapabilities ja esta em 0x18.")
+        else:
+            log("[NIC-LOCK] Nao localizei a chave Class da NIC - "
+                "fallback por registro indisponivel.", logging.WARNING)
+
+    # Caminho 3: re-habilita se Disabled
     status = _status_adaptador(adapter_name)
     snapshot["status"] = status
     if status and status.lower() == "disabled":
@@ -1509,9 +1625,11 @@ def restaurar_nic(snapshot: dict) -> None:
 
     with _NIC_LOCK_LOCK:
         try:
+            # Restaura cmdlet NDIS, quando usado
             if snapshot.get("pm_modified") and snapshot.get("pm"):
                 allow = _ps_bool_arg(
-                    snapshot["pm"].get("AllowComputerToTurnOffDevice", "Disabled"))
+                    snapshot["pm"].get("AllowComputerToTurnOffDevice",
+                                       "Disabled"))
                 script = (
                     f"try {{ Set-NetAdapterPowerManagement -Name '{name}' "
                     f"-AllowComputerToTurnOffDevice {allow} -NoRestart "
@@ -1520,11 +1638,41 @@ def restaurar_nic(snapshot: dict) -> None:
                 )
                 out = _run_powershell(script).strip()
                 if out == "OK":
-                    log(f"[NIC-LOCK] Estado original restaurado em '{name}' "
+                    log(f"[NIC-LOCK] Estado NDIS restaurado em '{name}' "
                         f"(AllowComputerToTurnOffDevice={allow}).")
                 else:
                     log(f"[NIC-LOCK] Falha ao restaurar PowerManagement: "
                         f"{out}", logging.WARNING)
+            # Restaura PnPCapabilities (fallback via registro)
+            if snapshot.get("pnp_capabilities_modified"):
+                regpath = snapshot.get("pnp_regpath")
+                orig = snapshot.get("pnp_capabilities_orig")
+                if regpath:
+                    if orig is None:
+                        # Nao existia a chave antes - apaga para voltar ao estado inicial
+                        reg_esc = regpath.replace("'", "''")
+                        script = (
+                            f"try {{ Remove-ItemProperty 'Registry::"
+                            f"{reg_esc}' -Name PnPCapabilities "
+                            f"-ErrorAction Stop; 'OK' }} catch "
+                            f"{{ $_.Exception.Message }}"
+                        )
+                        out = _run_powershell(script).strip()
+                        if out == "OK":
+                            log("[NIC-LOCK] PnPCapabilities removido "
+                                "(restaurado ao estado original: "
+                                "ausente).")
+                        else:
+                            log(f"[NIC-LOCK] Falha ao remover "
+                                f"PnPCapabilities: {out}",
+                                logging.WARNING)
+                    else:
+                        if _escrever_pnp_capabilities(regpath, int(orig)):
+                            log(f"[NIC-LOCK] PnPCapabilities restaurado "
+                                f"para 0x{int(orig):x}.")
+                        else:
+                            log("[NIC-LOCK] Falha ao restaurar "
+                                "PnPCapabilities.", logging.WARNING)
         except Exception as e:  # noqa: BLE001
             log(f"[NIC-LOCK] Erro na restauracao: {e}", logging.WARNING)
 
@@ -1548,7 +1696,7 @@ def nic_guard(adapter_name: str, snapshot: dict,
                         f"try {{ Enable-NetAdapter -Name '{adapter_name}' "
                         f"-Confirm:$false -ErrorAction Stop }} catch {{}}"
                     )
-                # 2) Re-aplica politica de energia
+                # 2) Re-aplica politica de energia (NDIS)
                 pm = obter_power_management(adapter_name)
                 if pm:
                     allow = str(pm.get("AllowComputerToTurnOffDevice",
@@ -1564,6 +1712,16 @@ def nic_guard(adapter_name: str, snapshot: dict,
                             f"-NoRestart -ErrorAction Stop }} catch {{}}"
                         )
                         snapshot["pm_modified"] = True
+                # 3) Re-aplica PnPCapabilities (fallback via registro)
+                if snapshot.get("pnp_capabilities_modified"):
+                    regpath = snapshot.get("pnp_regpath")
+                    if regpath:
+                        atual = _ler_pnp_capabilities(regpath)
+                        if atual != 0x18:
+                            log(f"[NIC-GUARD] PnPCapabilities mudou "
+                                f"({atual}). Reaplicando 0x18.",
+                                logging.WARNING)
+                            _escrever_pnp_capabilities(regpath, 0x18)
         except Exception as e:  # noqa: BLE001
             LOGGER.debug("nic_guard erro: %s", e)
         STOP_EVENT.wait(intervalo)
@@ -2046,6 +2204,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=None,
                    help="MAC do alvo (equivalente a -m, mas no grupo "
                         "AdaptiveKeepAlive)")
+    g.add_argument("--burst", type=int, default=1,
+                   help="Pacotes enviados em rajada por operacao do "
+                        "ciclo (1-20, padrao 1). Burst 3-5 simula uma "
+                        "sessao HTTP ou um ping sweep, parecendo "
+                        "comunicacao real. Pacotes dentro do burst saem "
+                        "com 30-120 ms entre si; o intervalo normal do "
+                        "ciclo so entra ao fim do burst.")
+    g.add_argument("--fast", action="store_true",
+                   help="Perfil rapido: --interval 0.5 --min-interval "
+                        "0.5 --jitter 0.15 --burst 3 e modo aggressive. "
+                        "Usa mais CPU/trafego, mas aparenta sessao ativa.")
 
     p.add_argument("--version", action="version",
                    version=f"{APP_NAME} {APP_VERSION}")
@@ -2121,6 +2290,20 @@ def _mostrar_power_management(adapters: list[dict]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Preset --fast: aplica antes do resto do fluxo
+    if args.fast:
+        args.interval = min(args.interval, 0.5)
+        args.min_interval = min(args.min_interval, 0.5)
+        args.jitter = max(0.15, min(args.jitter, 0.3))
+        if args.burst < 3:
+            args.burst = 3
+        if args.keepalive_mode == "basic":
+            args.keepalive_mode = "aggressive"
+
+    # Limites de seguranca para o burst
+    args.burst = max(1, min(20, int(args.burst)))
+
     setup_logging(args.logfile, args.quiet)
     _instalar_sinais()
 

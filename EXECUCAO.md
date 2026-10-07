@@ -417,7 +417,59 @@ d. Se a NIC está **nas duas listagens mas o programa ainda não
 
 ---
 
-## 11. Encerramento limpo
+## 11. Burst e perfil `--fast` — tráfego mais denso
+
+Para fazer o padrão parecer uma sessão ativa de verdade (não um "ping
+a cada 2s"), use:
+
+```bat
+ethkeepalive.bat -d 3 --anti-idle --lock-nic --raw-only ^
+    --target 192.168.1.1 --fast
+```
+
+O `--fast` é um atalho equivalente a:
+
+```
+--interval 0.5 --min-interval 0.5 --jitter 0.15 --burst 3 --keepalive-mode aggressive
+```
+
+**O que muda:**
+
+| Opção            | Default         | Com `--fast`     | Efeito                          |
+|------------------|-----------------|------------------|----------------------------------|
+| `--interval`     | 2.0 s           | 0.5 s            | Ciclos mais curtos               |
+| `--jitter`       | 0.3             | 0.15             | Timing menos "metronômico"       |
+| `--burst`        | 1               | 3                | 3 pacotes por operação do ciclo  |
+| `--keepalive-mode` | basic/adaptive| aggressive       | Acelera se detectar silêncio     |
+
+Ou controle fino:
+
+```bat
+python ethkeepalive.py -d 3 --anti-idle --raw-only ^
+    --interval 0.8 --jitter 0.2 --burst 5
+```
+
+### Como o burst se comporta
+
+Dentro de uma operação (ex.: `raw_tcp_http`), o programa envia **N
+pacotes** com 30-120 ms de pausa aleatória entre eles — simulando um
+handshake TCP + request + ACK + close. Em seguida respeita o
+`--interval` + jitter normal antes da próxima operação do ciclo.
+
+Burst **não** se aplica a sockets Windows (`tcp`, `http_get`,
+`http_head`, `http_post`) — esses são mais pesados; a lib limita a 1
+por ciclo mesmo que o usuário passe `--burst 10`.
+
+### Limites de segurança preservados
+
+- `SAFETY_MIN_INTERVAL = 0.5 s` (piso absoluto, mesmo com `--fast`).
+- `--burst` limitado a 1-20.
+- Nenhum flood: o burst termina, respira, e só então começa a próxima
+  operação.
+
+---
+
+## 12. Encerramento limpo
 
 - `Ctrl+C` sinaliza o `STOP_EVENT`, para as threads e:
   - Fecha sockets (short e keep-alive).

@@ -335,6 +335,25 @@ desligue a NIC por economia de energia"** como problemas diferentes:
 - `SAFETY_MAX_CONCURRENT = 1`   — no máximo uma conexão TCP ao mesmo tempo.
 - Sem flood, sem broadcast contínuo, todas as threads têm `sleep`.
 
+### ❓ Isso **garante** que o Windows não vai desativar o adaptador?
+
+**Não — garantia absoluta é impossível para programa em user space.**
+O que o programa controla e o que fica fora do alcance:
+
+| ✅ Está no alcance do programa                                                    | ❌ Fica fora                                      |
+|-----------------------------------------------------------------------------------|---------------------------------------------------|
+| Tráfego L2 constante via Npcap (driver NDIS enxerga atividade)                    | GPO corporativa                                   |
+| `Set-NetAdapterPowerManagement -AllowComputerToTurnOffDevice Disabled`            | Driver OEM com idle timer próprio                 |
+| Fallback: `PnPCapabilities = 0x18` na chave Class da NIC                          | UEFI/BIOS power settings                          |
+| `Enable-NetAdapter` se alguém desabilitar externamente                            | Clique manual em "Desabilitar" no Device Manager  |
+| Watchdog que reaplica a cada 10 s                                                 | Mobility Center em bateria agressiva              |
+| Restaura o estado original ao sair                                                | Hardware crash / cabo arrancado                   |
+
+Para a maioria dos cenários (idle timer do próprio driver, "turn off to
+save power"), o programa resolve. Para cenários corporativos
+(GPO/HVCI/Credential Guard), ou firmware, não há saída via software — o
+programa **avisa** mas não finge garantir.
+
 ### `--lock-nic` — impedir desativação da NIC enquanto roda
 
 Ao passar `--lock-nic`, o programa:
