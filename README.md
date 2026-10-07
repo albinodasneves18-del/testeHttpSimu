@@ -72,9 +72,22 @@ python ethkeepalive.py -d 2 --pcap captura.pcap
 
 # Verificar quais placas podem ser desligadas pelo Windows
 python ethkeepalive.py --check-power
+
+# AdaptiveKeepAlive - modo recomendado (anti-idle)
+python ethkeepalive.py -d 2 --anti-idle
+
+# AdaptiveKeepAlive mais insistente, com jitter e porta HTTP alvo
+python ethkeepalive.py -d 2 --keepalive-mode aggressive \
+    --target 192.168.1.1 --target-port 80 --jitter 0.5 \
+    --min-interval 1 --max-interval 60
+
+# Rodar apenas o diagnostico (nao envia trafego continuo)
+python ethkeepalive.py -d 2 --diagnostic
 ```
 
 ### Opções (argparse)
+
+**Modo clássico (`--keepalive-mode basic`, padrão):**
 
 | Opção                  | Descrição                                                         |
 |------------------------|-------------------------------------------------------------------|
@@ -93,6 +106,36 @@ python ethkeepalive.py --check-power
 | `--check-power`        | Mostra políticas de energia dos adaptadores e sai                 |
 | `-h`, `--help`         | Ajuda                                                             |
 | `--version`            | Versão                                                            |
+
+**AdaptiveKeepAlive (camada de resiliência):**
+
+| Opção                      | Descrição                                                       |
+|----------------------------|-----------------------------------------------------------------|
+| `--keepalive-mode <m>`     | `basic` (padrão) \| `adaptive` \| `aggressive`                  |
+| `--anti-idle`              | Atalho: ativa `--keepalive-mode adaptive` + diagnóstico         |
+| `--diagnostic`             | Executa o diagnóstico completo e sai                            |
+| `--jitter <s>`             | Variação aleatória do intervalo (padrão `0.3`, máx. `5`)        |
+| `--min-interval <s>`       | Intervalo mínimo entre testes (padrão `1.0`, piso `0.5`)        |
+| `--max-interval <s>`       | Intervalo máximo (padrão `30`, teto `300`)                      |
+| `--target-port <porta>`    | Porta TCP de destino para os testes (padrão `80`)               |
+| `--http-host <host>`       | Header `Host` das requisições HTTP (padrão: `--target`)         |
+| `--http-url <path>`        | Caminho usado nos HTTP GET/HEAD/POST (padrão `/`)               |
+| `--tcp-mode <modo>`        | `short` (padrão) \| `keep-alive` (reaproveita um socket)        |
+
+Modos:
+
+- **basic** – mantém o comportamento original (loop simples sobre `--proto`).
+- **adaptive** – alterna automaticamente entre ICMP, TCP connect, HTTP
+  GET/HEAD/POST e ARP, com testes de conectividade reais, backoff após
+  falhas e jitter controlado.
+- **aggressive** – como adaptive, mas reduz temporariamente o intervalo
+  (sempre acima do piso de segurança) quando detecta período prolongado
+  sem sucesso.
+
+> O programa **não altera** as configurações de energia da NIC. Se o
+> Windows estiver configurado para desligar o adaptador por economia de
+> energia, o diagnóstico avisa — a correção é manual (Gerenciador de
+> Dispositivos → aba *Gerenciamento de energia*).
 
 ---
 
@@ -117,6 +160,19 @@ python ethkeepalive.py --check-power
 | Detecção de economia de energia (`--check-power`)                    |  OK    |
 | Resumo estatístico ao encerrar                                       |  OK    |
 | Checagem de privilégio de Administrador                              |  OK    |
+| **AdaptiveKeepAlive**: ciclos ICMP → TCP → HTTP GET/HEAD/POST → ARP  |  OK    |
+| Modos `basic`, `adaptive`, `aggressive` (`--keepalive-mode`)         |  OK    |
+| Jitter + `--min-interval` / `--max-interval` com piso de segurança   |  OK    |
+| Máquina de estados `STARTING → HEALTHY → DEGRADED → DISCONNECTED → RECOVERING` | OK |
+| Watchdog acoplado que pausa envios enquanto a NIC está Down          |  OK    |
+| Bind TCP/HTTP no IPv4 da NIC (interface source selection)            |  OK    |
+| `--tcp-mode short` / `keep-alive` (socket reaproveitado)             |  OK    |
+| Testes de conectividade reais (`PACKET_SENT` ≠ `HTTP_SUCCESS`)       |  OK    |
+| Backoff exponencial moderado após 3 falhas consecutivas              |  OK    |
+| `--diagnostic` com relatório `[OK]/[WARN]/[FAIL]/[SKIP]`             |  OK    |
+| `--anti-idle` como atalho de adaptativo + diagnóstico                |  OK    |
+| Aviso claro sobre gerenciamento de energia (sem alterar automaticamente) | OK |
+| Limite rígido de 1 conexão TCP simultânea (sem flood)                |  OK    |
 
 ---
 
@@ -180,16 +236,61 @@ python ethkeepalive.py --check-power
 
 ```
 main()
- ├── listar_dispositivos()      -> PowerShell (Get-NetAdapter -IncludeHidden)
- ├── escolher_dispositivo()     -> interativo ou -d/-i
- ├── resolver_scapy_iface()     -> casa Windows name <-> \Device\NPF_{GUID}
- ├── thread servidor_http_fake  -> socket puro, 200 OK + JSON
- ├── thread watchdog_interface  -> Get-NetAdapter polling
- └── thread gerar_trafego       -> sendp() em loop (http/arp/dhcp/mixed)
+ ├── listar_dispositivos()         -> PowerShell (Get-NetAdapter -IncludeHidden)
+ ├── escolher_dispositivo()        -> interativo ou -d/-i
+ ├── resolver_scapy_iface()        -> casa Windows name <-> \Device\NPF_{GUID}
+ ├── _guess_local_ip/_ipv6()       -> IPv4/IPv6 do adaptador (bind source)
+ ├── executar_diagnostico()        -> relatório [OK]/[WARN]/[FAIL]
+ ├── thread servidor_http_fake     -> socket puro, 200 OK + JSON
+ ├── thread watchdog_interface(_adaptive) -> Get-NetAdapter polling
+ └── MODO:
+      ├── basic:   gerar_trafego()        -> sendp() em loop (http/arp/dhcp/mixed)
+      └── adaptive/aggressive:
+            AdaptiveKeepAlive.run()
+             ├── ciclos: ICMP -> TCP -> HTTP GET -> HTTP HEAD -> HTTP POST -> ARP
+             ├── bind TCP/HTTP no IPv4 da NIC
+             ├── jitter + backoff exponencial (dentro dos limites)
+             ├── máquina de estados STARTING→HEALTHY→DEGRADED→DISCONNECTED→RECOVERING
+             └── telemetria PACKET_SENT / ICMP_SUCCESS / TCP_CONNECTED / HTTP_SUCCESS
 ```
 
 Todas as threads são `daemon` e observam o `STOP_EVENT`. `Ctrl+C` sinaliza
 o evento, as threads saem e o resumo é impresso.
+
+---
+
+## AdaptiveKeepAlive — regra fundamental
+
+O `EthKeepAlive` trata **"manter atividade"** e **"impedir que o Windows
+desligue a NIC por economia de energia"** como problemas diferentes:
+
+- O **AdaptiveKeepAlive** gera tráfego legítimo e variado, verifica
+  conectividade real (ICMP/TCP/HTTP), monitora o estado da NIC via
+  `Get-NetAdapter` / `Get-NetAdapterStatistics` e recupera-se automaticamente
+  quando o link volta.
+- **Não** há garantia de que gerar tráfego impeça o Windows de desativar
+  o adaptador por política de energia. Se o diagnóstico detectar
+  `AllowComputerToTurnOffDevice = Enabled`, o programa avisa claramente
+  e orienta a desmarcar manualmente, mas nunca altera a configuração
+  por conta própria.
+
+### Distinção entre estados detectados
+
+| Situação                                 | Como o programa percebe                                   |
+|------------------------------------------|-----------------------------------------------------------|
+| Interface **sem tráfego**                | `last_activity` cresce → aumenta cadência (aggressive)    |
+| Interface **sem conectividade**          | Testes ICMP/TCP/HTTP falham → estado `DEGRADED` + backoff |
+| Interface **administrativamente Disabled** | `Get-NetAdapter.Status = Disabled` → pausa envios        |
+| Interface **afetada por energia**        | `--check-power` / diagnóstico mostra `[WARN]`             |
+| **Link físico caiu**                     | `Status = Down/Disconnected` → `DISCONNECTED` → `RECOVERING` |
+
+### Limites de segurança (fixos no código)
+
+- `SAFETY_MIN_INTERVAL = 0.5 s` — nunca envia mais rápido que isso.
+- `SAFETY_MAX_INTERVAL = 300 s` — teto absoluto do backoff.
+- `SAFETY_MAX_PAYLOAD  = 2048 B` — payload HTTP é truncado.
+- `SAFETY_MAX_CONCURRENT = 1`   — no máximo uma conexão TCP ao mesmo tempo.
+- Sem flood, sem broadcast contínuo, todas as threads têm `sleep`.
 
 ---
 

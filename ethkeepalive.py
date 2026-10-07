@@ -63,6 +63,15 @@ DEFAULT_PORT = 80
 DEFAULT_INTERVAL = 2.0
 WATCHDOG_INTERVAL = 5.0  # verifica status da interface a cada N segundos
 
+# Limites de seguranca - protegem o usuario contra configuracoes abusivas.
+SAFETY_MIN_INTERVAL = 0.5   # nunca enviar mais rapido que isto (segundos)
+SAFETY_MAX_INTERVAL = 300.0
+SAFETY_MAX_PAYLOAD = 2048   # bytes por requisicao
+SAFETY_MAX_CONCURRENT = 1   # conexoes TCP simultaneas no modo adaptativo
+
+# Ciclos do keep-alive adaptativo (sequencia A..F da especificacao)
+CICLOS_ADAPTATIVO = ["icmp", "tcp", "http_get", "http_head", "http_post", "arp"]
+
 # Estatisticas globais (atualizadas pelas threads)
 STATS: dict[str, Any] = {
     "started_at": None,
@@ -70,10 +79,31 @@ STATS: dict[str, Any] = {
     "pkts_http": 0,
     "pkts_arp": 0,
     "pkts_dhcp": 0,
+    "icmp_sent": 0,
+    "arp_sent": 0,
+    "http_sent": 0,
+    "tcp_connected": 0,
+    "bytes_sent": 0,
     "http_requests": 0,
     "reconnects": 0,
     "errors": 0,
+    # Testes de conectividade real (adaptativo)
+    "ok_icmp": 0, "fail_icmp": 0,
+    "ok_tcp": 0, "fail_tcp": 0,
+    "ok_http": 0, "fail_http": 0,
+    "ok_arp": 0, "fail_arp": 0,
+    "state_changes": 0,
 }
+
+
+class EstadoKA:
+    """Estados da maquina de estados do AdaptiveKeepAlive."""
+    STARTING = "STARTING"
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    DISCONNECTED = "DISCONNECTED"
+    RECOVERING = "RECOVERING"
+
 
 STOP_EVENT = threading.Event()
 LOGGER = logging.getLogger(APP_NAME)
@@ -655,6 +685,594 @@ def verificar_interface_ativa(adapter_name: str) -> bool:
 
 
 # ========================================================================
+# 10.5. ADAPTIVE KEEP-ALIVE (camada principal de resiliencia)
+# ========================================================================
+def _probe_tcp(src_ip: str | None, target_ip: str, target_port: int,
+               timeout: float = 2.0) -> tuple[bool, float]:
+    """Tenta um TCP connect pequeno a partir de src_ip. Retorna (ok, ms)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if src_ip:
+            try:
+                s.bind((src_ip, 0))
+            except OSError as e:
+                LOGGER.debug("bind(%s,0) falhou: %s", src_ip, e)
+        s.settimeout(timeout)
+        t0 = time.time()
+        s.connect((target_ip, target_port))
+        return True, (time.time() - t0) * 1000
+    except Exception as e:
+        LOGGER.debug("probe_tcp %s:%s falhou: %s", target_ip, target_port, e)
+        return False, 0.0
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def imprimir_cabecalho_interface(adapter: dict, scapy_iface: str,
+                                 src_ip: str | None, src_mac: str,
+                                 src_ipv6: str | None = None) -> None:
+    """Exibe o resumo da interface selecionada e informa sobre o binding."""
+    print("\nInterface selecionada:")
+    print(f"  Nome:        {adapter['name']}")
+    print(f"  Descricao:   {adapter['description']}")
+    print(f"  ifIndex:     {adapter['ifindex']}")
+    print(f"  IPv4:        {src_ip or '(nao detectado)'}")
+    print(f"  IPv6:        {src_ipv6 or '(nao detectado)'}")
+    print(f"  MAC:         {adapter['mac'] or '(desconhecido)'}")
+    print(f"  LinkSpeed:   {adapter['linkspeed']}")
+    print(f"  Scapy iface: {scapy_iface}")
+    if src_ip:
+        print("O trafego sera associado a esta interface (bind no IPv4 "
+              "+ envio raw pela Scapy iface).")
+    else:
+        print("ATENCAO: nao foi possivel detectar IPv4 do adaptador. "
+              "Sockets TCP/HTTP podem usar outra NIC. Envio raw continua "
+              "preso a interface Scapy escolhida.")
+
+
+def _guess_local_ipv6(adapter: dict) -> str | None:
+    """Tenta descobrir um endereco IPv6 global do adaptador."""
+    name = adapter["name"]
+    if not name or not is_windows():
+        return None
+    script = (
+        f"try {{ (Get-NetIPAddress -InterfaceAlias '{name}' "
+        "-AddressFamily IPv6 -ErrorAction Stop | "
+        "Where-Object { $_.IPAddress -notlike 'fe80*' } | "
+        "Select-Object -First 1).IPAddress }} catch { '' }"
+    )
+    out = _run_powershell(script).strip()
+    return out or None
+
+
+def _ler_bytes_interface(adapter_name: str) -> tuple[int, int] | None:
+    """Retorna (bytes_rx, bytes_tx) do adaptador via Get-NetAdapterStatistics."""
+    script = (
+        f"try {{ Get-NetAdapterStatistics -Name '{adapter_name}' "
+        "-ErrorAction Stop | "
+        "Select-Object ReceivedBytes,SentBytes | ConvertTo-Json -Compress "
+        "}} catch { '' }"
+    )
+    raw = _run_powershell(script).strip()
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return int(d.get("ReceivedBytes", 0)), int(d.get("SentBytes", 0))
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+class AdaptiveKeepAlive:
+    """
+    Camada adaptativa que alterna entre varios testes de conectividade real
+    (ICMP, TCP connect, HTTP GET/HEAD/POST, ARP) em uma unica NIC. Mantem
+    uma maquina de estados (STARTING / HEALTHY / DEGRADED / DISCONNECTED /
+    RECOVERING) e aplica backoff/jitter dentro de limites de seguranca.
+    """
+
+    def __init__(self, args: argparse.Namespace, adapter: dict,
+                 scapy_iface: str, src_ip: str | None, src_mac: str) -> None:
+        self.args = args
+        self.adapter = adapter
+        self.scapy_iface = scapy_iface
+        self.src_ip = src_ip or None
+        self.src_mac = src_mac
+        self.target_ip = args.target
+        self.target_port = args.target_port or args.port or 80
+        self.http_host = args.http_host or args.target
+        self.http_url = args.http_url or "/"
+        self.mode = args.keepalive_mode  # basic|adaptive|aggressive
+        self.tcp_mode = args.tcp_mode    # short|keep-alive
+
+        # Intervalos (sempre dentro de limites seguros)
+        self.min_interval = max(SAFETY_MIN_INTERVAL,
+                                float(args.min_interval))
+        self.max_interval = max(self.min_interval,
+                                min(SAFETY_MAX_INTERVAL,
+                                    float(args.max_interval)))
+        self.base_interval = max(self.min_interval,
+                                 min(self.max_interval, float(args.interval)))
+        self.jitter = max(0.0, min(float(args.jitter), 5.0))
+        self.current_interval = self.base_interval
+
+        # Estado
+        self.state = EstadoKA.STARTING
+        self.last_activity = time.time()
+        self.last_success = time.time()
+        self.consecutive_failures = 0
+        self.consecutive_successes = 0
+        self.cycle_index = 0
+        self._interface_up = True
+        self._conn_lock = threading.Lock()  # garante no maximo 1 conexao
+        self._keep_sock: socket.socket | None = None
+
+    # ----- Estado -----
+    def set_state(self, novo: str) -> None:
+        if novo != self.state:
+            log(f"STATE: {self.state} -> {novo}")
+            self.state = novo
+            STATS["state_changes"] += 1
+
+    def set_interface_status(self, up: bool) -> None:
+        """Chamado pelo watchdog quando o status muda."""
+        was_up = self._interface_up
+        self._interface_up = up
+        if was_up and not up:
+            self._close_keep_sock()
+            self.set_state(EstadoKA.DISCONNECTED)
+        elif not was_up and up:
+            self.set_state(EstadoKA.RECOVERING)
+
+    # ----- Testes -----
+    def _close_keep_sock(self) -> None:
+        if self._keep_sock is not None:
+            try:
+                self._keep_sock.close()
+            except Exception:
+                pass
+            self._keep_sock = None
+
+    def _next_test(self) -> str:
+        if self.mode == "basic":
+            return "http_get"
+        kind = CICLOS_ADAPTATIVO[self.cycle_index % len(CICLOS_ADAPTATIVO)]
+        self.cycle_index += 1
+        return kind
+
+    def _record_success(self, kind: str) -> None:
+        STATS[f"ok_{kind}"] = STATS.get(f"ok_{kind}", 0) + 1
+        self.consecutive_failures = 0
+        self.consecutive_successes += 1
+        self.last_activity = time.time()
+        self.last_success = time.time()
+        if self.current_interval > self.base_interval:
+            self.current_interval = max(self.base_interval,
+                                        self.current_interval * 0.8)
+        if self.state in (EstadoKA.RECOVERING, EstadoKA.STARTING,
+                          EstadoKA.DEGRADED):
+            if self.consecutive_successes >= 2:
+                self.set_state(EstadoKA.HEALTHY)
+
+    def _record_failure(self, kind: str) -> None:
+        STATS[f"fail_{kind}"] = STATS.get(f"fail_{kind}", 0) + 1
+        self.consecutive_failures += 1
+        self.consecutive_successes = 0
+        self.last_activity = time.time()
+        if self.consecutive_failures >= 3:
+            # backoff exponencial controlado
+            self.current_interval = min(self.max_interval,
+                                        self.current_interval * 1.5)
+            if self.state == EstadoKA.HEALTHY:
+                self.set_state(EstadoKA.DEGRADED)
+
+    def _test_icmp(self) -> bool:
+        """ICMP echo request via Scapy, com src_ip e iface forcados."""
+        try:
+            from scapy.all import sr1, ICMP  # import local - precisa Npcap
+            seq = STATS["icmp_sent"] & 0xFFFF
+            pkt = IP(src=self.src_ip or "0.0.0.0", dst=self.target_ip) / \
+                ICMP(id=seq, seq=seq) / Raw(load=b"EKA")
+            STATS["icmp_sent"] += 1
+            STATS["pkts_sent"] += 1
+            reply = sr1(pkt, iface=self.scapy_iface, timeout=1,
+                        verbose=False)
+            if reply is not None:
+                log(f"[ICMP] ok -> {self.target_ip}")
+                self._record_success("icmp")
+                return True
+            log(f"[ICMP] sem resposta -> {self.target_ip}",
+                logging.WARNING)
+            self._record_failure("icmp")
+            return False
+        except PermissionError:
+            log("[ICMP] PermissionError (precisa Administrador).",
+                logging.ERROR)
+            self._record_failure("icmp")
+            return False
+        except Exception as e:  # noqa: BLE001
+            log(f"[ICMP] erro: {e}", logging.WARNING)
+            self._record_failure("icmp")
+            return False
+
+    def _test_tcp(self) -> bool:
+        """TCP connect curto, bind ao IPv4 do adaptador."""
+        with self._conn_lock:
+            ok, dt = _probe_tcp(self.src_ip, self.target_ip,
+                                self.target_port, timeout=2.0)
+            if ok:
+                STATS["tcp_connected"] += 1
+                log(f"[TCP] connect {self.target_ip}:{self.target_port} "
+                    f"({dt:.0f}ms)")
+                self._record_success("tcp")
+            else:
+                log(f"[TCP] falhou -> "
+                    f"{self.target_ip}:{self.target_port}",
+                    logging.WARNING)
+                self._record_failure("tcp")
+            return ok
+
+    def _http_request(self, method: str) -> bool:
+        """Realiza HTTP curto, bind no IPv4 do adaptador."""
+        with self._conn_lock:
+            keep_alive = (self.tcp_mode == "keep-alive")
+            s: socket.socket | None
+            reused = False
+            if keep_alive and self._keep_sock is not None:
+                s = self._keep_sock
+                reused = True
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    if self.src_ip:
+                        s.bind((self.src_ip, 0))
+                except OSError as e:
+                    LOGGER.debug("http bind %s falhou: %s", self.src_ip, e)
+                s.settimeout(3.0)
+                try:
+                    s.connect((self.target_ip, self.target_port))
+                except Exception as e:  # noqa: BLE001
+                    log(f"[HTTP {method}] connect falhou: {e}",
+                        logging.WARNING)
+                    self._record_failure("http")
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    return False
+
+            try:
+                seq = STATS["http_sent"] + 1
+                body = ""
+                if method == "POST":
+                    body = json.dumps({
+                        "client": APP_NAME,
+                        "sequence": seq,
+                        "timestamp": iso_timestamp(),
+                    })
+                conn_hdr = "keep-alive" if keep_alive else "close"
+                headers = [
+                    f"{method} {self.http_url} HTTP/1.1",
+                    f"Host: {self.http_host}",
+                    f"User-Agent: {APP_NAME}/{APP_VERSION}",
+                    "Accept: */*",
+                    f"Connection: {conn_hdr}",
+                ]
+                if method == "POST":
+                    headers += [
+                        "Content-Type: application/json",
+                        f"Content-Length: {len(body)}",
+                    ]
+                req = ("\r\n".join(headers) + "\r\n\r\n" + body)
+                data = req.encode("utf-8", errors="replace")
+                if len(data) > SAFETY_MAX_PAYLOAD:
+                    data = data[:SAFETY_MAX_PAYLOAD]
+                s.sendall(data)
+                STATS["http_sent"] = seq
+                STATS["pkts_sent"] += 1
+                STATS["pkts_http"] += 1
+                STATS["bytes_sent"] += len(data)
+
+                resp = s.recv(4096)
+                if resp.startswith(b"HTTP/"):
+                    status_line = resp.split(b"\r\n", 1)[0].decode(
+                        "latin-1", "ignore")
+                    log(f"[HTTP {method}] {status_line}"
+                        + (" (reused)" if reused else ""))
+                    self._record_success("http")
+                    ok = True
+                else:
+                    log(f"[HTTP {method}] resposta nao-HTTP "
+                        f"({len(resp)} bytes)", logging.WARNING)
+                    self._record_failure("http")
+                    ok = False
+            except Exception as e:  # noqa: BLE001
+                log(f"[HTTP {method}] erro: {e}", logging.WARNING)
+                self._record_failure("http")
+                ok = False
+
+            # Nunca deixa socket morto. No modo keep-alive, so reaproveita
+            # se a transacao foi bem sucedida.
+            if keep_alive and ok:
+                self._keep_sock = s
+            else:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                if self._keep_sock is s:
+                    self._keep_sock = None
+            return ok
+
+    def _test_arp(self) -> bool:
+        try:
+            from scapy.all import srp1
+            pkt = (
+                Ether(src=self.src_mac, dst=MAC_BROADCAST)
+                / ARP(op=1, hwsrc=self.src_mac,
+                      psrc=self.src_ip or "0.0.0.0",
+                      hwdst="00:00:00:00:00:00",
+                      pdst=self.target_ip)
+            )
+            STATS["arp_sent"] += 1
+            STATS["pkts_arp"] += 1
+            STATS["pkts_sent"] += 1
+            reply = srp1(pkt, iface=self.scapy_iface, timeout=1,
+                         verbose=False)
+            if reply is not None:
+                log(f"[ARP] reply recebido de {self.target_ip}")
+                self._record_success("arp")
+                return True
+            # Alvo fora da LAN provavelmente nao responde ARP:
+            # isso nao conta como falha critica.
+            log(f"[ARP] sem reply (alvo pode nao estar na LAN)")
+            self._record_success("arp")  # considera sucesso de envio
+            return True
+        except Exception as e:  # noqa: BLE001
+            log(f"[ARP] erro: {e}", logging.WARNING)
+            self._record_failure("arp")
+            return False
+
+    # ----- Loop principal -----
+    def _log_status(self) -> None:
+        now = time.time()
+        act = now - self.last_activity
+        suc = now - self.last_success
+        log(f"[KEEPALIVE] Estado: {self.state} | "
+            f"Ultima atividade: {act:.1f}s | "
+            f"Ultimo sucesso: {suc:.1f}s | "
+            f"intervalo: {self.current_interval:.2f}s")
+
+    def _sleep_jitter(self) -> None:
+        base = self.current_interval
+        if self.jitter > 0:
+            delta = random.uniform(-self.jitter, self.jitter)
+            wait = base + delta
+        else:
+            wait = base
+        wait = max(self.min_interval, min(self.max_interval, wait))
+        STOP_EVENT.wait(wait)
+
+    def run(self) -> None:
+        """Loop principal do keep-alive adaptativo."""
+        log(f"AdaptiveKeepAlive iniciado (modo={self.mode}, "
+            f"base={self.base_interval:.2f}s, jitter={self.jitter}s, "
+            f"min={self.min_interval}s, max={self.max_interval}s, "
+            f"tcp={self.tcp_mode})")
+        self.set_state(EstadoKA.STARTING)
+
+        # Backoff state para 'target nao responde'
+        aggressive_silence = 20.0  # modo aggressive: 20s sem sucesso -> acelera
+        last_status_log = 0.0
+        did_initial = False
+
+        while not STOP_EVENT.is_set():
+            if not self._interface_up:
+                # watchdog ja sinalizou; aguarda a volta
+                STOP_EVENT.wait(1.0)
+                continue
+
+            if not did_initial:
+                self.set_state(EstadoKA.HEALTHY)
+                did_initial = True
+
+            if self.state == EstadoKA.RECOVERING:
+                log("[WATCHDOG] Reiniciando keep-alive")
+                self.consecutive_failures = 0
+                self.current_interval = self.base_interval
+
+            kind = self._next_test()
+            try:
+                if kind == "icmp":
+                    self._test_icmp()
+                elif kind == "tcp":
+                    self._test_tcp()
+                elif kind == "http_get":
+                    self._http_request("GET")
+                elif kind == "http_head":
+                    self._http_request("HEAD")
+                elif kind == "http_post":
+                    self._http_request("POST")
+                elif kind == "arp":
+                    self._test_arp()
+            except Exception as e:  # noqa: BLE001
+                STATS["errors"] += 1
+                log(f"Erro inesperado no ciclo {kind}: {e}", logging.ERROR)
+
+            # Modo aggressive: encurta temporariamente quando ha silencio util
+            if self.mode == "aggressive":
+                silencio = time.time() - self.last_success
+                if silencio > aggressive_silence:
+                    novo = max(self.min_interval, self.base_interval * 0.5)
+                    if abs(novo - self.current_interval) > 0.1:
+                        self.current_interval = novo
+                        log(f"[KEEPALIVE] WARNING: {silencio:.1f}s sem "
+                            f"sucesso. Reduzindo intervalo para "
+                            f"{self.current_interval:.2f}s.",
+                            logging.WARNING)
+
+            # Log periodico de estado
+            now = time.time()
+            if now - last_status_log >= 15.0:
+                self._log_status()
+                last_status_log = now
+
+            self._sleep_jitter()
+
+        self._close_keep_sock()
+        log("AdaptiveKeepAlive encerrado.")
+
+
+def watchdog_interface_adaptive(adapter_name: str,
+                                aka: AdaptiveKeepAlive) -> None:
+    """
+    Watchdog da interface vinculado a um AdaptiveKeepAlive. Monitora
+    Get-NetAdapter periodicamente e sinaliza mudancas de estado.
+    """
+    last_status: str | None = None
+    while not STOP_EVENT.is_set():
+        status = (_status_adaptador(adapter_name) or "").strip()
+        if status != (last_status or ""):
+            if last_status is None:
+                last_status = status
+            else:
+                low = status.lower()
+                if low == "up":
+                    STATS["reconnects"] += 1
+                    log(f"[WATCHDOG] Interface voltou ({status}).")
+                    aka.set_interface_status(True)
+                elif low in ("down", "disconnected"):
+                    log(f"[WATCHDOG] Interface caiu ({status}).",
+                        logging.WARNING)
+                    aka.set_interface_status(False)
+                elif low == "disabled":
+                    log("[WATCHDOG] Interface administrativamente "
+                        "desabilitada.", logging.WARNING)
+                    aka.set_interface_status(False)
+                else:
+                    log(f"[WATCHDOG] Status desconhecido: '{status}'.",
+                        logging.WARNING)
+                last_status = status
+        STOP_EVENT.wait(WATCHDOG_INTERVAL)
+
+
+# ========================================================================
+# 10.6. DIAGNOSTICO (executado antes do AdaptiveKeepAlive)
+# ========================================================================
+def executar_diagnostico(args: argparse.Namespace, adapter: dict,
+                        scapy_iface: str | None,
+                        src_ip: str | None) -> bool:
+    """
+    Executa um diagnostico completo e imprime relatorio. Retorna True
+    se nao houver nenhum item 'FAIL'. 'WARN' nao bloqueia a execucao.
+    """
+    results: list[tuple[str, str, str]] = []
+
+    def chk(nome: str, status: str, detalhe: str = "") -> None:
+        results.append((nome, status, detalhe))
+
+    # Scapy
+    chk("Scapy", "OK" if SCAPY_OK else "FAIL",
+        "" if SCAPY_OK else "pip install scapy")
+
+    # Npcap: podemos listar interfaces?
+    if SCAPY_OK:
+        try:
+            ifaces = get_if_list()
+            if ifaces:
+                chk("Npcap", "OK", f"{len(ifaces)} interfaces visiveis")
+            else:
+                chk("Npcap", "FAIL",
+                    "nenhuma interface - reinstale Npcap "
+                    "(WinPcap API-compatible)")
+        except Exception as e:  # noqa: BLE001
+            chk("Npcap", "FAIL", str(e))
+    else:
+        chk("Npcap", "SKIP", "scapy indisponivel")
+
+    # Interface
+    if adapter:
+        chk("Interface", "OK", adapter["description"])
+    else:
+        chk("Interface", "FAIL", "adaptador nao selecionado")
+
+    # Link
+    if adapter:
+        st = (adapter["status"] or "").strip()
+        if st.lower() == "up":
+            chk("Link", "OK", st)
+        elif st.lower() in ("down", "disconnected"):
+            chk("Link", "WARN", st)
+        elif st.lower() == "disabled":
+            chk("Link", "WARN", "interface administrativamente desabilitada")
+        else:
+            chk("Link", "WARN", st or "desconhecido")
+
+    # IPv4 / MAC / ifIndex
+    chk("IPv4", "OK" if src_ip else "WARN", src_ip or "sem IPv4")
+    if adapter:
+        chk("MAC", "OK" if adapter["mac"] else "WARN",
+            adapter["mac"] or "sem MAC")
+        chk("ifIndex", "OK" if adapter["ifindex"] else "WARN",
+            str(adapter["ifindex"]))
+
+    # Conectividade
+    tp = args.target_port or args.port or 80
+    ok, dt = _probe_tcp(src_ip, args.target, tp, timeout=2.0)
+    if ok:
+        chk("Connectivity", "OK",
+            f"TCP {args.target}:{tp} ok ({dt:.0f}ms)")
+    else:
+        chk("Connectivity", "WARN",
+            f"TCP {args.target}:{tp} falhou (adaptativo usara backoff)")
+
+    # Power management
+    if adapter:
+        pm = obter_power_management(adapter["name"])
+        if pm is None:
+            chk("Power Management", "SKIP", "sem dados")
+        else:
+            allow = str(pm.get("AllowComputerToTurnOffDevice", "")).lower()
+            if allow in ("enabled", "true", "1"):
+                chk("Power Management", "WARN",
+                    "AllowComputerToTurnOffDevice=Enabled "
+                    "- Windows pode desligar a NIC")
+            else:
+                chk("Power Management", "OK",
+                    f"AllowComputerToTurnOffDevice="
+                    f"{pm.get('AllowComputerToTurnOffDevice')}")
+
+    # Pode enviar? Faz um envio ARP minimo (nao e flood).
+    if SCAPY_OK and scapy_iface and adapter:
+        try:
+            dummy = (Ether(src=adapter["mac"] or "02:00:00:00:00:01",
+                           dst=MAC_BROADCAST)
+                     / ARP(op=1, hwsrc=adapter["mac"] or "02:00:00:00:00:01",
+                           psrc=src_ip or "0.0.0.0",
+                           pdst=args.target))
+            sendp(dummy, iface=scapy_iface, verbose=False)
+            chk("Can send", "OK", f"via {scapy_iface}")
+        except Exception as e:  # noqa: BLE001
+            chk("Can send", "FAIL", str(e))
+
+    # Relatorio
+    print("\nETHKEEPALIVE DIAGNOSTIC")
+    print("-" * 50)
+    tags = {"OK": "[OK]  ", "WARN": "[WARN]", "FAIL": "[FAIL]",
+            "SKIP": "[SKIP]"}
+    for nome, status, detalhe in results:
+        linha = f"{tags[status]} {nome}"
+        if detalhe:
+            linha += f" - {detalhe}"
+        print(linha)
+    print("-" * 50)
+    return not any(s == "FAIL" for _, s, _ in results)
+
+
+# ========================================================================
 # 11. CLI (argparse)
 # ========================================================================
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -669,6 +1287,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  python ethkeepalive.py --listar\n"
             "  python ethkeepalive.py -d 2 -t 192.168.1.100 -n 1\n"
             "  python ethkeepalive.py -i \"Ethernet 2\" --proto mixed\n"
+            "  python ethkeepalive.py -d 2 --anti-idle\n"
+            "  python ethkeepalive.py -d 2 --keepalive-mode aggressive "
+            "--jitter 0.5\n"
+            "  python ethkeepalive.py -d 2 --diagnostic\n"
             "  python ethkeepalive.py            (modo interativo)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -702,6 +1324,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--check-power", action="store_true",
                    help="Mostra politicas de economia de energia dos "
                         "adaptadores e sai")
+
+    # ----- AdaptiveKeepAlive -----
+    g = p.add_argument_group("AdaptiveKeepAlive")
+    g.add_argument("--keepalive-mode", dest="keepalive_mode",
+                   choices=["basic", "adaptive", "aggressive"],
+                   default="basic",
+                   help="basic=comportamento classico (so --proto); "
+                        "adaptive=alterna ICMP/TCP/HTTP/ARP com testes "
+                        "reais; aggressive=encurta intervalo quando ha "
+                        "silencio prolongado (sempre dentro dos limites)")
+    g.add_argument("--anti-idle", dest="anti_idle", action="store_true",
+                   help="Atalho: ativa --keepalive-mode adaptive e roda "
+                        "diagnostico antes de iniciar")
+    g.add_argument("--diagnostic", action="store_true",
+                   help="Executa diagnostico completo e sai")
+    g.add_argument("--jitter", type=float, default=0.3,
+                   help="Variacao aleatoria do intervalo em segundos "
+                        "(padrao: 0.3)")
+    g.add_argument("--min-interval", dest="min_interval", type=float,
+                   default=1.0,
+                   help=f"Intervalo minimo entre testes (padrao: 1.0, "
+                        f"piso de seguranca: {SAFETY_MIN_INTERVAL})")
+    g.add_argument("--max-interval", dest="max_interval", type=float,
+                   default=30.0,
+                   help="Intervalo maximo entre testes "
+                        "(padrao: 30, teto: 300)")
+    g.add_argument("--target-port", dest="target_port", type=int,
+                   default=80,
+                   help="Porta TCP de destino para testes do "
+                        "adaptativo (padrao: 80)")
+    g.add_argument("--http-host", dest="http_host", type=str, default=None,
+                   help="Header Host das requisicoes HTTP "
+                        "(padrao: o IP de --target)")
+    g.add_argument("--http-url", dest="http_url", type=str, default="/",
+                   help="Caminho usado nos HTTP GET/HEAD/POST "
+                        "(padrao: /)")
+    g.add_argument("--tcp-mode", dest="tcp_mode",
+                   choices=["short", "keep-alive"], default="short",
+                   help="Reaproveitar socket TCP entre ciclos "
+                        "(padrao: short)")
+
     p.add_argument("--version", action="version",
                    version=f"{APP_NAME} {APP_VERSION}")
     return p.parse_args(argv)
@@ -723,18 +1386,32 @@ def _instalar_sinais() -> None:
 
 
 def _resumo_estatisticas() -> None:
+    def hms(s: float) -> str:
+        s = int(s)
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
     started = STATS.get("started_at")
     dur = (time.time() - started) if started else 0.0
     print("\n" + "=" * 60)
-    print(f"{APP_NAME} v{APP_VERSION} - resumo")
+    print("ETHKEEPALIVE STATISTICS")
     print("=" * 60)
-    print(f"Duracao:              {dur:,.1f} s")
+    print(f"Tempo ativo:          {hms(dur)}")
     print(f"Pacotes enviados:     {STATS['pkts_sent']:,}")
     print(f"  - HTTP:             {STATS['pkts_http']:,}")
     print(f"  - ARP:              {STATS['pkts_arp']:,}")
     print(f"  - DHCP:             {STATS['pkts_dhcp']:,}")
-    print(f"Requisicoes HTTP:     {STATS['http_requests']:,}")
-    print(f"Reconexoes detectadas:{STATS['reconnects']:,}")
+    print(f"  - ICMP:             {STATS['icmp_sent']:,}")
+    print(f"Bytes enviados:       {STATS['bytes_sent']:,} B")
+    print(f"Testes ICMP:          {STATS['ok_icmp'] + STATS['fail_icmp']:,}"
+          f" (ok {STATS['ok_icmp']:,} / falha {STATS['fail_icmp']:,})")
+    print(f"Conexoes TCP:         {STATS['ok_tcp'] + STATS['fail_tcp']:,}"
+          f" (ok {STATS['ok_tcp']:,} / falha {STATS['fail_tcp']:,})")
+    print(f"HTTP requests:        {STATS['http_sent']:,}"
+          f" (ok {STATS['ok_http']:,} / falha {STATS['fail_http']:,})")
+    print(f"ARP probes:           {STATS['arp_sent']:,}"
+          f" (ok {STATS['ok_arp']:,} / falha {STATS['fail_arp']:,})")
+    print(f"Requisicoes no HTTP fake: {STATS['http_requests']:,}")
+    print(f"Mudancas de estado:   {STATS['state_changes']:,}")
+    print(f"Quedas/Recuperacoes:  {STATS['reconnects']:,}")
     print(f"Erros registrados:    {STATS['errors']:,}")
     print("=" * 60)
 
@@ -810,7 +1487,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n>> Mantendo ativo: '{adapter['description']}' "
           f"(iface='{adapter['name']}', status={adapter['status']}, "
-          f"mac={adapter['mac']})\n")
+          f"mac={adapter['mac']})")
 
     # Checagens para envio raw
     if not SCAPY_OK:
@@ -831,11 +1508,53 @@ def main(argv: list[str] | None = None) -> int:
         return 4
     log(f"Interface Scapy resolvida: {scapy_iface}")
 
-    STATS["started_at"] = time.time()
+    # IPs/MACs do adaptador - usados para o binding da camada adaptativa
+    src_ip = _guess_local_ip(adapter)
+    src_ipv6 = _guess_local_ipv6(adapter)
+    try:
+        src_mac = get_if_hwaddr(scapy_iface)
+    except Exception:
+        src_mac = adapter["mac"] or "02:00:00:00:00:01"
 
+    imprimir_cabecalho_interface(adapter, scapy_iface, src_ip, src_mac,
+                                 src_ipv6)
+    if not src_ip:
+        log("Sem IPv4 detectado - o binding de sockets TCP/HTTP nao pode "
+            "ser garantido para esta NIC. O envio raw (ICMP/ARP via Scapy) "
+            "continua restrito a interface escolhida.", logging.WARNING)
+
+    # Modo diagnostico (encerra apos relatorio)
+    if args.diagnostic:
+        ok = executar_diagnostico(args, adapter, scapy_iface, src_ip)
+        return 0 if ok else 5
+
+    # Resolver modo efetivo (--anti-idle e um atalho)
+    mode = args.keepalive_mode
+    if args.anti_idle and mode == "basic":
+        mode = "adaptive"
+    args.keepalive_mode = mode
+
+    adaptive = mode in ("adaptive", "aggressive")
+    if adaptive:
+        print()
+        if not executar_diagnostico(args, adapter, scapy_iface, src_ip):
+            log("Diagnostico falhou. Encerrando.", logging.ERROR)
+            return 5
+        pm = obter_power_management(adapter["name"]) or {}
+        if str(pm.get("AllowComputerToTurnOffDevice", "")).lower() in (
+                "enabled", "true", "1"):
+            log("A interface esta sendo afetada por gerenciamento de "
+                "energia. Trafego de rede nao garante que o Windows "
+                "mantera o dispositivo ligado. Corrija em "
+                "Gerenciador de Dispositivos > Propriedades do adaptador "
+                "> Gerenciamento de energia (ou "
+                "Set-NetAdapterPowerManagement -AllowComputerToTurnOffDevice "
+                "Disabled).", logging.WARNING)
+
+    STATS["started_at"] = time.time()
     threads: list[threading.Thread] = []
 
-    # Servidor HTTP
+    # Servidor HTTP fake (compartilhado por ambos os modos)
     if not args.sem_http:
         t_http = threading.Thread(target=servidor_http_fake,
                                   args=(args.port,), daemon=True,
@@ -845,19 +1564,30 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log("Servidor HTTP fake desativado (--sem-http).")
 
-    # Watchdog
-    t_wd = threading.Thread(target=watchdog_interface,
-                            args=(adapter["name"],),
-                            daemon=True, name="watchdog")
-    t_wd.start()
-    threads.append(t_wd)
-
-    # Trafego
-    t_tx = threading.Thread(target=gerar_trafego,
-                            args=(args, adapter, scapy_iface),
-                            daemon=True, name="tx")
-    t_tx.start()
-    threads.append(t_tx)
+    if adaptive:
+        # Modo adaptativo: AdaptiveKeepAlive + watchdog acoplado
+        aka = AdaptiveKeepAlive(args, adapter, scapy_iface, src_ip, src_mac)
+        t_wd = threading.Thread(target=watchdog_interface_adaptive,
+                                args=(adapter["name"], aka),
+                                daemon=True, name="watchdog")
+        t_wd.start()
+        threads.append(t_wd)
+        t_tx = threading.Thread(target=aka.run, daemon=True,
+                                name="adaptive-keepalive")
+        t_tx.start()
+        threads.append(t_tx)
+    else:
+        # Modo classico: watchdog simples + gerar_trafego
+        t_wd = threading.Thread(target=watchdog_interface,
+                                args=(adapter["name"],),
+                                daemon=True, name="watchdog")
+        t_wd.start()
+        threads.append(t_wd)
+        t_tx = threading.Thread(target=gerar_trafego,
+                                args=(args, adapter, scapy_iface),
+                                daemon=True, name="tx")
+        t_tx.start()
+        threads.append(t_tx)
 
     try:
         while not STOP_EVENT.is_set():
