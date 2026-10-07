@@ -343,41 +343,188 @@ def localizar_por_nome(adapters: list[dict], nome: str) -> dict | None:
 # ========================================================================
 # 6. RESOLUCAO DE INTERFACE SCAPY (nome Windows -> NPF device)
 # ========================================================================
-def resolver_scapy_iface(adapter: dict) -> str | None:
+def _ler_interface_guid(adapter_name: str) -> str | None:
+    """
+    Retorna o InterfaceGuid da NIC (ex: '{XXXX-XXXX-...}') via PowerShell.
+    Esse GUID aparece dentro do nome Scapy '\\Device\\NPF_{GUID}'.
+    """
+    if not adapter_name or not is_windows():
+        return None
+    nome_esc = adapter_name.replace("'", "''")
+    script = (
+        f"try {{ (Get-NetAdapter -Name '{nome_esc}' -IncludeHidden "
+        "-ErrorAction Stop).InterfaceGuid } catch { '' }"
+    )
+    out = _run_powershell(script).strip()
+    return out or None
+
+
+def _coletar_candidatos_scapy() -> list[dict]:
+    """Devolve a lista de interfaces conhecidas por Scapy, normalizada."""
+    out: list[dict] = []
+    if not SCAPY_OK:
+        return out
+    try:
+        for key, iface in conf.ifaces.data.items():  # type: ignore[attr-defined]
+            info = {
+                "key": key,
+                "network_name": (getattr(iface, "network_name", "")
+                                 or getattr(iface, "name", "") or ""),
+                "description": getattr(iface, "description", "") or "",
+                "mac": (getattr(iface, "mac", "") or "").lower(),
+                "guid": (getattr(iface, "guid", "") or "").lower(),
+                "index": (getattr(iface, "index", None)
+                          or getattr(iface, "win_index", None)),
+            }
+            out.append(info)
+    except Exception as e:  # noqa: BLE001
+        LOGGER.debug("conf.ifaces inacessivel: %s", e)
+    return out
+
+
+def _mac_norm(m: str | None) -> str:
+    if not m:
+        return ""
+    return m.replace("-", ":").replace(".", "").strip().lower()
+
+
+def _guid_norm(g: str | None) -> str:
+    if not g:
+        return ""
+    return g.strip().strip("{}").lower()
+
+
+def resolver_scapy_iface(adapter: dict,
+                         debug: bool = False) -> str | None:
     """
     Scapy no Windows usa nomes do tipo '\\Device\\NPF_{GUID}'. Esta funcao
     tenta casar o adaptador escolhido com uma das interfaces conhecidas
-    por Scapy, usando descricao ou MAC.
+    por Scapy, em multiplas estrategias (em ordem de confianca):
+
+      1) MAC exato
+      2) GUID (via InterfaceGuid do PowerShell) presente no NPF name
+         ou no atributo guid do Scapy
+      3) ifIndex
+      4) Nome da conexao (NetConnectionID: 'Ethernet 3')
+      5) Descricao exata
+      6) Descricao substring (apenas se unico candidato)
+
+    Alguns adaptadores retornam MAC vazio na listagem (NIC fisica sem
+    cabo mesmo apos subir, VLAN parent, etc.); por isso o fallback por
+    GUID/ifIndex e importante.
     """
     if not SCAPY_OK:
         return None
-    desc = adapter["description"].lower()
-    mac = adapter["mac"].lower()
 
-    # Via conf.ifaces (API nova do Scapy no Windows)
-    try:
-        for name, iface in conf.ifaces.data.items():  # type: ignore[attr-defined]
-            iface_desc = getattr(iface, "description", "") or ""
-            iface_mac = (getattr(iface, "mac", "") or "").lower()
-            if desc and iface_desc and desc == iface_desc.lower():
-                return name
-            if mac and iface_mac and mac == iface_mac:
-                return name
-    except Exception:
-        pass
+    desc = (adapter.get("description") or "").strip()
+    name = (adapter.get("name") or "").strip()
+    mac = _mac_norm(adapter.get("mac"))
+    ifindex = adapter.get("ifindex") or 0
+    guid = _guid_norm(_ler_interface_guid(name))
 
-    # Fallback: get_if_list + match por hwaddr
-    try:
-        for iface in get_if_list():
+    candidatos = _coletar_candidatos_scapy()
+
+    if debug:
+        log(f"[resolver] alvo: name='{name}' desc='{desc}' mac='{mac}' "
+            f"ifindex={ifindex} guid='{guid}'")
+        for c in candidatos:
+            log(f"[resolver] scapy: key='{c['key']}' "
+                f"net='{c['network_name']}' desc='{c['description']}' "
+                f"mac='{c['mac']}' idx={c['index']} guid='{c['guid']}'")
+
+    # 1) MAC exato
+    if mac:
+        for c in candidatos:
+            if c["mac"] and _mac_norm(c["mac"]) == mac:
+                return c["key"]
+
+    # 2) GUID
+    if guid:
+        for c in candidatos:
+            cguid = _guid_norm(c["guid"])
+            if cguid and cguid == guid:
+                return c["key"]
+            # Normalmente o key e '\Device\NPF_{GUID}'; procurar substring
+            if guid in c["key"].lower():
+                return c["key"]
+
+    # 3) ifIndex
+    if ifindex:
+        for c in candidatos:
             try:
-                if mac and get_if_hwaddr(iface).lower() == mac:
-                    return iface
-            except Exception:
+                if c["index"] is not None and int(c["index"]) == int(ifindex):
+                    return c["key"]
+            except (TypeError, ValueError):
                 continue
-    except Exception:
-        pass
+
+    # 4) Nome da conexao (NetConnectionID)
+    if name:
+        n_lc = name.lower()
+        for c in candidatos:
+            if c["network_name"] and c["network_name"].strip().lower() == n_lc:
+                return c["key"]
+
+    # 5) Descricao exata (case-insensitive, strip)
+    if desc:
+        d_lc = desc.lower()
+        for c in candidatos:
+            if (c["description"]
+                    and c["description"].strip().lower() == d_lc):
+                return c["key"]
+
+    # 6) Descricao substring - so se exatamente um candidato bate
+    if desc:
+        d_lc = desc.lower()
+        matches = [c for c in candidatos
+                   if (c["description"]
+                       and (d_lc in c["description"].lower()
+                            or c["description"].lower() in d_lc))]
+        if len(matches) == 1:
+            return matches[0]["key"]
+        if debug and matches:
+            log(f"[resolver] substring ambigua: "
+                f"{[m['key'] for m in matches]}", logging.WARNING)
+
+    # 7) Fallback: get_if_list + MAC
+    if mac:
+        try:
+            for iface in get_if_list():
+                try:
+                    if _mac_norm(get_if_hwaddr(iface)) == mac:
+                        return iface
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     return None
+
+
+def diagnostico_scapy_vs_windows(adapter: dict) -> None:
+    """Imprime, lado a lado, o que o Windows ve e o que o Scapy ve."""
+    print("\nDiagnostico Scapy x Windows:")
+    print("-" * 70)
+    print("Adaptador escolhido (Get-NetAdapter):")
+    print(f"  name='{adapter.get('name')}'")
+    print(f"  description='{adapter.get('description')}'")
+    print(f"  mac='{adapter.get('mac')}'  ifindex={adapter.get('ifindex')}")
+    print(f"  status='{adapter.get('status')}'  "
+          f"linkspeed='{adapter.get('linkspeed')}'")
+    guid = _ler_interface_guid(adapter.get("name") or "")
+    print(f"  InterfaceGuid={guid or '(vazio)'}")
+    print()
+    print("Interfaces vistas pelo Scapy (conf.ifaces):")
+    candidatos = _coletar_candidatos_scapy()
+    if not candidatos:
+        print("  (nenhuma - verifique instalacao do Npcap)")
+    else:
+        for i, c in enumerate(candidatos, 1):
+            print(f"  [{i}] key='{c['key']}'")
+            print(f"      network_name='{c['network_name']}'")
+            print(f"      description='{c['description']}'")
+            print(f"      mac='{c['mac']}'  index={c['index']}  "
+                  f"guid='{c['guid']}'")
+    print("-" * 70)
 
 
 # ========================================================================
@@ -1713,6 +1860,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--check-power", action="store_true",
                    help="Mostra politicas de economia de energia dos "
                         "adaptadores e sai")
+    p.add_argument("--list-scapy", dest="list_scapy", action="store_true",
+                   help="Mostra as interfaces conhecidas pelo Scapy "
+                        "(para debug de mapeamento) e sai")
 
     # ----- AdaptiveKeepAlive -----
     g = p.add_argument_group("AdaptiveKeepAlive")
@@ -1864,6 +2014,21 @@ def main(argv: list[str] | None = None) -> int:
         _mostrar_power_management(adapters)
         return 0
 
+    if args.list_scapy:
+        print("Interfaces conhecidas pelo Scapy (conf.ifaces):")
+        print("-" * 70)
+        cs = _coletar_candidatos_scapy()
+        if not cs:
+            print("  (vazia - Scapy nao disponivel ou Npcap nao instalado)")
+        for i, c in enumerate(cs, 1):
+            print(f"  [{i}] key='{c['key']}'")
+            print(f"      network_name='{c['network_name']}'")
+            print(f"      description='{c['description']}'")
+            print(f"      mac='{c['mac']}'  index={c['index']}  "
+                  f"guid='{c['guid']}'")
+        print("-" * 70)
+        return 0
+
     if not adapters:
         log("Nenhum adaptador encontrado. Impossivel prosseguir.",
             logging.ERROR)
@@ -1906,9 +2071,21 @@ def main(argv: list[str] | None = None) -> int:
 
     scapy_iface = resolver_scapy_iface(adapter)
     if not scapy_iface:
+        # Tenta de novo em modo debug e imprime visao Scapy x Windows
         log("Nao consegui mapear o adaptador para uma interface do Scapy. "
-            "Verifique se o Npcap esta instalado em modo "
-            "WinPcap-compatible.", logging.ERROR)
+            "Rodando resolucao em modo debug...", logging.ERROR)
+        resolver_scapy_iface(adapter, debug=True)
+        diagnostico_scapy_vs_windows(adapter)
+        print(
+            "\nPossiveis causas:\n"
+            "  1) Npcap foi instalado SEM 'WinPcap API-compatible Mode'.\n"
+            "     Reinstale marcando essa opcao.\n"
+            "  2) O adaptador escolhido nao tem driver Npcap ligado "
+            "(ex.: WAN Miniport, Tunneling, Debug Network Adapter).\n"
+            "  3) O MAC veio vazio na listagem - escolha a NIC fisica\n"
+            "     principal (coluna MAC preenchida), ou use outro ID.\n"
+            "  4) Rode como Administrador.\n"
+        )
         return 4
     log(f"Interface Scapy resolvida: {scapy_iface}")
 

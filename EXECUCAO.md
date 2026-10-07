@@ -289,7 +289,57 @@ Para iniciar automaticamente quando o usuário entra na máquina:
 
 ---
 
-## 9. Encerramento limpo
+## 9. Troubleshooting — "Nao consegui mapear o adaptador para Scapy"
+
+Esse erro aparece quando o adaptador escolhido na coluna `ID` **não
+tem** correspondência direta na lista do Scapy. Causas típicas:
+
+1. **Npcap instalado sem `WinPcap API-compatible Mode`** – reinstale
+   marcando essa opção (ver [INSTALL.md](INSTALL.md)).
+2. **Adaptador escolhido não é físico** – `WAN Miniport`, `Teredo
+   Tunneling`, `Debug Network Adapter` e similares aparecem em
+   `Get-NetAdapter` mas o Npcap/Scapy não enxerga. Escolha o adaptador
+   `Realtek`/`Intel`/`USB` com MAC preenchido na listagem.
+3. **MAC vazio na listagem** – a NIC está no sistema mas sem endereço
+   ativo (driver em erro, porta de uma placa dual-port sem cabo). O
+   programa agora cai no fallback por GUID/ifIndex; se mesmo assim
+   falhar, veja o passo 4.
+
+### Debug passo a passo
+
+a. Rode `python ethkeepalive.py --list-scapy` para ver **exatamente**
+   quais interfaces o Scapy enumera:
+   ```
+   [1] key='\Device\NPF_{XXXX-...-YYYY}'
+       network_name='Ethernet'
+       description='Realtek PCIe GbE Family Controller'
+       mac='a0:ad:9f:13:e4:30'  index=2  guid='xxxx-...-yyyy'
+   ```
+b. Compare com `--listar` (visão do Windows).
+c. Se a NIC está **no `--listar` mas não no `--list-scapy`**:
+   - O driver não exporta via Npcap → reinstale Npcap em
+     `WinPcap API-compatible Mode`.
+   - Ou essa NIC é virtual/driver custom (`#2` de placa dual-port sem
+     link) – escolha a outra porta.
+d. Se a NIC está **nas duas listagens mas o programa ainda não
+   mapeia**:
+   - Ao falhar, o programa imprime automaticamente o diagnóstico
+     `Scapy x Windows` lado a lado e tenta ler o `InterfaceGuid`.
+   - Procure linhas `[resolver]` no console – elas mostram a tentativa
+     de match MAC → GUID → ifIndex → nome → descrição.
+
+> No seu caso específico (`Ethernet 3`, `Realtek PCIe GbE Family
+> Controller #2` com MAC vazio e `0 bps`): essa é a **segunda porta**
+> de uma placa dual-port sem cabo conectado. O Windows mostra a NIC,
+> mas o Scapy só vê quem tem um link ativo visível ao driver NDIS.
+> Use `-d` apontando para o ID **com MAC preenchido** (no exemplo,
+> ID 14 — `Ethernet`, `a0:ad:9f:13:e4:30`, 100 Mbps). Se precisar
+> manter especificamente a porta `#2`, conecte um cabo nela primeiro
+> (mesmo que seja em um switch).
+
+---
+
+## 10. Encerramento limpo
 
 - `Ctrl+C` sinaliza o `STOP_EVENT`, para as threads e:
   - Fecha sockets (short e keep-alive).
