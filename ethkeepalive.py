@@ -72,6 +72,11 @@ SAFETY_MAX_CONCURRENT = 1   # conexoes TCP simultaneas no modo adaptativo
 # Ciclos do keep-alive adaptativo (sequencia A..F da especificacao)
 CICLOS_ADAPTATIVO = ["icmp", "tcp", "http_get", "http_head", "http_post", "arp"]
 
+# Ciclos para o modo raw-only (sem sockets Windows). Usado quando a NIC
+# nao tem IPv4 configurado - todos os pacotes sao enviados via Scapy
+# sendp() preso a interface escolhida, independente da tabela de rota.
+CICLOS_RAW_ONLY = ["arp", "raw_icmp", "raw_tcp_http", "raw_udp"]
+
 # Estatisticas globais (atualizadas pelas threads)
 STATS: dict[str, Any] = {
     "started_at": None,
@@ -868,7 +873,13 @@ def imprimir_cabecalho_interface(adapter: dict, scapy_iface: str,
     print(f"  ifIndex:     {adapter['ifindex']}")
     print(f"  IPv4:        {src_ip or '(nao detectado)'}")
     print(f"  IPv6:        {src_ipv6 or '(nao detectado)'}")
-    print(f"  MAC:         {adapter['mac'] or '(desconhecido)'}")
+    mac_win = adapter.get("mac") or ""
+    if src_mac and src_mac != mac_win:
+        print(f"  MAC:         {src_mac}  (origem efetiva nos pacotes)")
+        if mac_win:
+            print(f"               Windows reporta: {mac_win}")
+    else:
+        print(f"  MAC:         {src_mac or '(desconhecido)'}")
     print(f"  LinkSpeed:   {adapter['linkspeed']}")
     print(f"  Scapy iface: {scapy_iface}")
     if src_ip:
@@ -946,6 +957,19 @@ class AdaptiveKeepAlive:
         self.jitter = max(0.0, min(float(args.jitter), 5.0))
         self.current_interval = self.base_interval
 
+        # Modo raw-only: so Scapy sendp, sem sockets Windows.
+        # Auto-ativa quando a NIC nao tem IPv4 configurado.
+        self.raw_only = bool(getattr(args, "raw_only", False))
+        if not self.src_ip and not self.raw_only:
+            log("[KEEPALIVE] NIC sem IPv4 configurado - ativando "
+                "raw-only automaticamente (so Scapy sendp).",
+                logging.WARNING)
+            self.raw_only = True
+
+        # MACs e IP de alvo para pacotes raw
+        self.target_mac = (getattr(args, "target_mac_override", None)
+                           or args.mac or MAC_BROADCAST)
+
         # Estado
         self.state = EstadoKA.STARTING
         self.last_activity = time.time()
@@ -984,6 +1008,10 @@ class AdaptiveKeepAlive:
             self._keep_sock = None
 
     def _next_test(self) -> str:
+        if self.raw_only:
+            kind = CICLOS_RAW_ONLY[self.cycle_index % len(CICLOS_RAW_ONLY)]
+            self.cycle_index += 1
+            return kind
         if self.mode == "basic":
             return "http_get"
         kind = CICLOS_ADAPTATIVO[self.cycle_index % len(CICLOS_ADAPTATIVO)]
@@ -1183,6 +1211,84 @@ class AdaptiveKeepAlive:
             self._record_failure("arp")
             return False
 
+    # ----- Testes RAW ONLY (sem sockets Windows) -----
+    def _raw_icmp(self) -> bool:
+        """ICMP echo via sendp - fire-and-forget, so conta o envio."""
+        try:
+            from scapy.all import ICMP
+            seq = STATS["icmp_sent"] & 0xFFFF
+            src = self.src_ip or "0.0.0.0"
+            pkt = (Ether(src=self.src_mac, dst=self.target_mac)
+                   / IP(src=src, dst=self.target_ip)
+                   / ICMP(id=seq, seq=seq)
+                   / Raw(load=b"EKA"))
+            sendp(pkt, iface=self.scapy_iface, verbose=False)
+            STATS["icmp_sent"] += 1
+            STATS["pkts_sent"] += 1
+            log(f"[RAW ICMP] enviado -> {self.target_ip}")
+            self._record_success("icmp")
+            return True
+        except Exception as e:  # noqa: BLE001
+            log(f"[RAW ICMP] erro: {e}", logging.WARNING)
+            self._record_failure("icmp")
+            return False
+
+    def _raw_tcp_http(self) -> bool:
+        """TCP SYN/PA com payload HTTP via sendp - fire-and-forget."""
+        try:
+            seq = STATS["http_sent"] + 1
+            src = self.src_ip or "0.0.0.0"
+            method = random.choice(["GET", "GET", "HEAD", "POST"])
+            payload = _build_http_payload(seq, method,
+                                          self.http_host or self.target_ip)
+            pkt = (
+                Ether(src=self.src_mac, dst=self.target_mac)
+                / IP(src=src, dst=self.target_ip)
+                / TCP(sport=random.randint(49152, 65535),
+                      dport=self.target_port, flags="PA",
+                      seq=random.randint(1, 2**31 - 1))
+                / Raw(load=payload)
+            )
+            sendp(pkt, iface=self.scapy_iface, verbose=False)
+            STATS["http_sent"] = seq
+            STATS["pkts_http"] += 1
+            STATS["pkts_sent"] += 1
+            STATS["bytes_sent"] += len(payload)
+            log(f"[RAW TCP/HTTP] {method} enviado -> "
+                f"{self.target_ip}:{self.target_port}")
+            self._record_success("http")
+            return True
+        except Exception as e:  # noqa: BLE001
+            log(f"[RAW TCP/HTTP] erro: {e}", logging.WARNING)
+            self._record_failure("http")
+            return False
+
+    def _raw_udp(self) -> bool:
+        """UDP com payload curto via sendp - fire-and-forget."""
+        try:
+            src = self.src_ip or "0.0.0.0"
+            payload = json.dumps({
+                "client": APP_NAME,
+                "sequence": STATS["pkts_sent"] + 1,
+                "timestamp": iso_timestamp(),
+            }).encode("utf-8")
+            pkt = (
+                Ether(src=self.src_mac, dst=self.target_mac)
+                / IP(src=src, dst=self.target_ip)
+                / UDP(sport=random.randint(49152, 65535), dport=53)
+                / Raw(load=payload)
+            )
+            sendp(pkt, iface=self.scapy_iface, verbose=False)
+            STATS["pkts_sent"] += 1
+            STATS["bytes_sent"] += len(payload)
+            log(f"[RAW UDP] enviado -> {self.target_ip}")
+            self._record_success("tcp")  # usa contador tcp como "L4 ok"
+            return True
+        except Exception as e:  # noqa: BLE001
+            log(f"[RAW UDP] erro: {e}", logging.WARNING)
+            self._record_failure("tcp")
+            return False
+
     # ----- Loop principal -----
     def _log_status(self) -> None:
         now = time.time()
@@ -1245,6 +1351,12 @@ class AdaptiveKeepAlive:
                     self._http_request("POST")
                 elif kind == "arp":
                     self._test_arp()
+                elif kind == "raw_icmp":
+                    self._raw_icmp()
+                elif kind == "raw_tcp_http":
+                    self._raw_tcp_http()
+                elif kind == "raw_udp":
+                    self._raw_udp()
             except Exception as e:  # noqa: BLE001
                 STATS["errors"] += 1
                 log(f"Erro inesperado no ciclo {kind}: {e}", logging.ERROR)
@@ -1918,6 +2030,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "em UEFI/BIOS e NAO pode ser bloqueado por "
                         "programa em user space; o programa so alerta "
                         "sobre mudancas de VBS.")
+    g.add_argument("--raw-only", dest="raw_only", action="store_true",
+                   help="So gera trafego via Scapy raw (sendp) preso a "
+                        "interface escolhida. Ignora sockets TCP/HTTP do "
+                        "Windows. Ativado automaticamente quando a NIC "
+                        "nao tem IPv4 configurado.")
+    g.add_argument("--src-ip", dest="src_ip_override", type=str,
+                   default=None,
+                   help="Forca o IPv4 de origem nos pacotes (util quando "
+                        "a NIC nao tem IP configurado; ex: 169.254.1.1)")
+    g.add_argument("--src-mac", dest="src_mac_override", type=str,
+                   default=None,
+                   help="Forca o MAC de origem (sobrescreve o detectado)")
+    g.add_argument("--target-mac", dest="target_mac_override", type=str,
+                   default=None,
+                   help="MAC do alvo (equivalente a -m, mas no grupo "
+                        "AdaptiveKeepAlive)")
 
     p.add_argument("--version", action="version",
                    version=f"{APP_NAME} {APP_VERSION}")
@@ -2090,19 +2218,33 @@ def main(argv: list[str] | None = None) -> int:
     log(f"Interface Scapy resolvida: {scapy_iface}")
 
     # IPs/MACs do adaptador - usados para o binding da camada adaptativa
-    src_ip = _guess_local_ip(adapter)
+    src_ip = args.src_ip_override or _guess_local_ip(adapter)
     src_ipv6 = _guess_local_ipv6(adapter)
     try:
-        src_mac = get_if_hwaddr(scapy_iface)
+        scapy_mac = get_if_hwaddr(scapy_iface)
     except Exception:
-        src_mac = adapter["mac"] or "02:00:00:00:00:01"
+        scapy_mac = None
+    src_mac = (args.src_mac_override
+               or scapy_mac
+               or adapter["mac"]
+               or "02:00:00:00:00:01")
+
+    # Preenche o MAC do adaptador na visualizacao quando o Scapy achou
+    if not adapter.get("mac") and scapy_mac:
+        adapter["mac"] = scapy_mac
 
     imprimir_cabecalho_interface(adapter, scapy_iface, src_ip, src_mac,
                                  src_ipv6)
+    if args.src_ip_override:
+        log(f"src_ip forcado por --src-ip: {src_ip}")
+    if args.src_mac_override:
+        log(f"src_mac forcado por --src-mac: {src_mac}")
     if not src_ip:
         log("Sem IPv4 detectado - o binding de sockets TCP/HTTP nao pode "
             "ser garantido para esta NIC. O envio raw (ICMP/ARP via Scapy) "
-            "continua restrito a interface escolhida.", logging.WARNING)
+            "continua restrito a interface escolhida. Se --anti-idle "
+            "estiver ativo, raw-only sera ligado automaticamente.",
+            logging.WARNING)
 
     # Modo diagnostico (encerra apos relatorio)
     if args.diagnostic:

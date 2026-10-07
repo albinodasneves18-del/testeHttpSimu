@@ -289,7 +289,85 @@ Para iniciar automaticamente quando o usuário entra na máquina:
 
 ---
 
-## 9. Troubleshooting — "Nao consegui mapear o adaptador para Scapy"
+## 9. NIC sem IPv4 configurado — modo `--raw-only`
+
+Se a NIC que você quer manter ativa **não tem IP configurado** (porta
+secundária de uma placa dual-port, NIC sem DHCP, NIC em VLAN sem IP, ou
+qualquer caso onde `IPv4: (nao detectado)` aparece no cabeçalho), os
+testes TCP/HTTP via socket vão **sempre falhar** — não porque a NIC
+está morta, mas porque o Windows roteia esses sockets por outra
+interface (a que tem rota default).
+
+**O que acontece:**
+
+- `ICMP sem resposta` → não há rota IP para o alvo via essa NIC.
+- `[TCP] falhou → 192.168.1.1:80` → o socket foi por outra NIC.
+- `[HTTP GET] connect falhou: WinError 10061` → idem.
+- Porém `[ARP] reply recebido de 192.168.1.1` → **a NIC está viva**
+  no nível 2 e **recebeu pacote de volta**.
+
+### Solução: `--raw-only`
+
+O programa detecta automaticamente a ausência de IPv4 e liga **raw-only**,
+no qual todos os pacotes saem via `scapy.sendp(iface=...)` presos à
+interface escolhida — sem passar pelo roteamento do Windows. Os ciclos
+viram:
+
+```
+arp  →  raw_icmp  →  raw_tcp_http  →  raw_udp
+```
+
+Isso gera tráfego Ethernet legítimo com a L2 correta (`src_mac` da NIC)
+independente de haver IP configurado. Para forçar manualmente:
+
+```
+python ethkeepalive.py -d 3 --anti-idle --raw-only
+```
+
+### Forçar um IP de origem fictício
+
+Alguns switches/routers só processam pacotes com `src IP` válido na
+sub-rede. Nesse caso, informe um IP:
+
+```
+python ethkeepalive.py -d 3 --anti-idle --raw-only ^
+    --src-ip 192.168.1.200 --target 192.168.1.1 ^
+    --target-mac aa:bb:cc:dd:ee:ff
+```
+
+- `--src-ip` – IPv4 que vai no header dos pacotes raw.
+- `--src-mac` – MAC de origem (default: o MAC real da NIC detectado via Scapy).
+- `--target-mac` – MAC do próximo salto (default: broadcast). Se você
+  souber o MAC do gateway, informar aqui aumenta a chance do ARP e
+  demais pacotes serem aceitos pelo switch.
+
+### No seu caso específico (log do console)
+
+A linha `[ARP] reply recebido de 192.168.1.1` confirmou que a `Ethernet
+3` **está viva** e tem pelo menos um dispositivo respondendo no outro
+lado. O estado `DEGRADED` apareceu só porque os testes L3 (ICMP/TCP
+sockets) vão por outra NIC. Rodando novamente com `--raw-only` (ou
+simplesmente deixando o auto-detect ativar), o estado fica `HEALTHY`:
+
+```
+ethkeepalive.bat -d 3 --anti-idle --lock-nic --raw-only ^
+    --target 192.168.1.1
+```
+
+Esperado agora:
+
+```
+[RAW ICMP] enviado -> 192.168.1.1
+[RAW TCP/HTTP] GET enviado -> 192.168.1.1:80
+[RAW UDP] enviado -> 192.168.1.1
+[ARP] reply recebido de 192.168.1.1
+```
+
+Todos como sucesso. O NIC continua recebendo tráfego L2 real.
+
+---
+
+## 10. Troubleshooting — "Nao consegui mapear o adaptador para Scapy"
 
 Esse erro aparece quando o adaptador escolhido na coluna `ID` **não
 tem** correspondência direta na lista do Scapy. Causas típicas:
@@ -339,7 +417,7 @@ d. Se a NIC está **nas duas listagens mas o programa ainda não
 
 ---
 
-## 10. Encerramento limpo
+## 11. Encerramento limpo
 
 - `Ctrl+C` sinaliza o `STOP_EVENT`, para as threads e:
   - Fecha sockets (short e keep-alive).
