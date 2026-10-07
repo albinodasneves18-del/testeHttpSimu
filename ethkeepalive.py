@@ -1311,6 +1311,244 @@ def nic_guard(adapter_name: str, snapshot: dict,
 
 
 # ========================================================================
+# 10.57. IOMMU GUARD - monitora e tenta manter o DMA Remapping da NIC
+#                     no estado atual (atualmente DESABILITADO).
+# ========================================================================
+# IMPORTANTE / HONESTIDADE:
+#   - IOMMU em si (Intel VT-d / AMD-Vi) e um recurso de firmware (UEFI).
+#     Nenhum programa em user space pode ligar/desligar IOMMU - isso
+#     fica no setup da BIOS.
+#   - No Windows, o que uma aplicacao consegue observar/mexer sao:
+#       * O status geral de VBS/DeviceGuard
+#         (Win32_DeviceGuard: VirtualizationBasedSecurityStatus,
+#          SecurityServicesConfigured, SecurityServicesRunning).
+#       * A politica de "DMA Remapping" POR DISPOSITIVO PCIe
+#         (DEVPKEY_Device_DmaRemappingPolicy), armazenada em
+#         HKLM\SYSTEM\CurrentControlSet\Enum\<PnPInstance>\Device
+#         Parameters\DmaRemappingCompatible (DWORD 0=Disabled, 1=Enabled).
+#   - Este modulo tira uma "foto" do estado atual (snapshot), monitora
+#     mudancas periodicamente, loga alertas e - quando permitido - tenta
+#     reverter a chave de registro do dispositivo para o valor original.
+#     Mudancas em DeviceGuard/VBS so entram em vigor APOS reboot, entao
+#     reverter em runtime nao desfaz um reboot que ja aconteceu com
+#     outra politica.
+
+_IOMMU_SNAPSHOT: dict[str, Any] = {}
+_IOMMU_LOCK = threading.Lock()
+
+
+def _ler_pnp_instance(adapter_name: str) -> str | None:
+    """Retorna o PnPDeviceID (ex: PCI\\VEN_8086&DEV_153B\\...) do adaptador."""
+    if not is_windows():
+        return None
+    script = (
+        f"try {{ (Get-NetAdapter -Name '{adapter_name}' "
+        "-IncludeHidden -ErrorAction Stop).PnPDeviceID }} catch { '' }"
+    )
+    out = _run_powershell(script).strip()
+    return out or None
+
+
+def ler_estado_iommu(adapter_name: str | None) -> dict:
+    """
+    Captura:
+      - device_guard: VBS/HVCI status (sistema todo).
+      - dma_remapping_policy: DEVPKEY_Device_DmaRemappingPolicy do adaptador.
+      - dma_remapping_compat: valor em HKLM...Device Parameters\\
+        DmaRemappingCompatible, se existir.
+      - pnp_id: PnPDeviceID do adaptador (necessario para reverter via reg).
+    Retorna {} se nao for Windows ou se falhar.
+    """
+    estado: dict[str, Any] = {}
+    if not is_windows():
+        return estado
+
+    # Device Guard / VBS (sistema)
+    script = (
+        "try { Get-CimInstance -ClassName Win32_DeviceGuard "
+        "-Namespace 'root\\Microsoft\\Windows\\DeviceGuard' "
+        "-ErrorAction Stop | Select-Object "
+        "VirtualizationBasedSecurityStatus,"
+        "SecurityServicesConfigured,SecurityServicesRunning,"
+        "AvailableSecurityProperties | ConvertTo-Json -Compress "
+        "} catch { '' }"
+    )
+    raw = _run_powershell(script).strip()
+    if raw:
+        try:
+            estado["device_guard"] = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+    if not adapter_name:
+        return estado
+
+    pnp = _ler_pnp_instance(adapter_name)
+    if pnp:
+        estado["pnp_id"] = pnp
+
+    # Politica PnP (DEVPKEY_Device_DmaRemappingPolicy)
+    if pnp:
+        pnp_escaped = pnp.replace("'", "''")
+        script = (
+            f"try {{ $p = Get-PnpDeviceProperty -InstanceId '{pnp_escaped}' "
+            "-KeyName 'DEVPKEY_Device_DmaRemappingPolicy' "
+            "-ErrorAction Stop; $p.Data } catch { '' }"
+        )
+        raw = _run_powershell(script).strip()
+        if raw:
+            # Data costuma ser int (0=Disabled, 1=Enabled)
+            try:
+                estado["dma_remapping_policy"] = int(raw)
+            except ValueError:
+                estado["dma_remapping_policy"] = raw
+
+        # Chave de registro Device Parameters\DmaRemappingCompatible
+        reg_path = (f"HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\{pnp}"
+                    "\\Device Parameters")
+        reg_escaped = reg_path.replace("'", "''")
+        script = (
+            f"try {{ (Get-ItemProperty -Path '{reg_escaped}' "
+            "-Name DmaRemappingCompatible -ErrorAction Stop)"
+            ".DmaRemappingCompatible } catch { '' }"
+        )
+        raw = _run_powershell(script).strip()
+        if raw:
+            try:
+                estado["dma_remapping_compat"] = int(raw)
+                estado["dma_remapping_regpath"] = reg_path
+            except ValueError:
+                estado["dma_remapping_compat"] = raw
+
+    return estado
+
+
+def _descrever_vbs(code: Any) -> str:
+    """VirtualizationBasedSecurityStatus: 0=Off, 1=Configured but off, 2=Running."""
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return str(code)
+    return {0: "Off", 1: "Configured but not running", 2: "Running"}.get(
+        c, str(c))
+
+
+def _descrever_dma(code: Any) -> str:
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return str(code)
+    return {0: "Disabled", 1: "Enabled"}.get(c, str(c))
+
+
+def _reverter_dma_remapping(adapter: dict, snapshot: dict,
+                            valor_desejado: int) -> bool:
+    """
+    Tenta restaurar a chave de registro
+    HKLM\\...Device Parameters\\DmaRemappingCompatible para `valor_desejado`.
+
+    Devolve True em caso de sucesso. Exige Administrador. A mudanca so
+    toma efeito depois que o dispositivo for re-enumerado (geralmente
+    reboot ou Disable/Enable da NIC via Device Manager). O programa NAO
+    desabilita a NIC automaticamente so para re-enumerar - isso cortaria
+    o keep-alive.
+    """
+    reg_path = snapshot.get("dma_remapping_regpath")
+    if not reg_path or not is_admin() or not is_windows():
+        return False
+    reg_escaped = reg_path.replace("'", "''")
+    script = (
+        f"try {{ New-ItemProperty -Path '{reg_escaped}' "
+        f"-Name DmaRemappingCompatible -Value {int(valor_desejado)} "
+        f"-PropertyType DWord -Force -ErrorAction Stop | Out-Null; "
+        f"'OK' }} catch {{ $_.Exception.Message }}"
+    )
+    out = _run_powershell(script).strip()
+    if out == "OK":
+        return True
+    log(f"[IOMMU-GUARD] Falha ao reverter DmaRemappingCompatible: {out}",
+        logging.WARNING)
+    return False
+
+
+def imprimir_estado_iommu(adapter_name: str, estado: dict) -> None:
+    print("\nIOMMU / DMA Remapping - snapshot inicial:")
+    print("-" * 50)
+    dg = estado.get("device_guard") or {}
+    vbs = dg.get("VirtualizationBasedSecurityStatus")
+    print(f"  VBS (sistema):             {_descrever_vbs(vbs)}")
+    print(f"  SecurityServicesConfigured: {dg.get('SecurityServicesConfigured')}")
+    print(f"  SecurityServicesRunning:    {dg.get('SecurityServicesRunning')}")
+    pol = estado.get("dma_remapping_policy")
+    if pol is not None:
+        print(f"  DMA Remapping Policy (PnP): {_descrever_dma(pol)}  "
+              f"[{pol}]")
+    cmp = estado.get("dma_remapping_compat")
+    if cmp is not None:
+        print(f"  DmaRemappingCompatible (reg): {_descrever_dma(cmp)}  "
+              f"[{cmp}]")
+    if estado.get("pnp_id"):
+        print(f"  PnPDeviceID: {estado['pnp_id']}")
+    print("-" * 50)
+    print("  (IOMMU em si e controlado pela UEFI; este programa so")
+    print("   monitora e tenta manter a politica DO DISPOSITIVO.)")
+
+
+def iommu_watchdog(adapter: dict, snapshot: dict,
+                   intervalo: float = 20.0,
+                   tentar_reverter: bool = True) -> None:
+    """
+    Thread guardia do IOMMU/DMA Remapping da NIC.
+    - Se detectar mudanca na politica do dispositivo, loga alerta.
+    - Se `tentar_reverter`, reescreve a chave de registro para o
+      valor original (so entra em vigor na proxima re-enumeracao).
+    - Se detectar mudanca em VBS/DeviceGuard, loga alerta (sem acao -
+      exige reboot).
+    """
+    orig_dma = snapshot.get("dma_remapping_compat")
+    if orig_dma is None:
+        orig_dma = snapshot.get("dma_remapping_policy")
+    orig_dg = (snapshot.get("device_guard") or {}).get(
+        "VirtualizationBasedSecurityStatus")
+
+    while not STOP_EVENT.is_set():
+        try:
+            with _IOMMU_LOCK:
+                atual = ler_estado_iommu(adapter["name"])
+
+                # 1) DMA Remapping da NIC
+                dma_now = atual.get("dma_remapping_compat")
+                if dma_now is None:
+                    dma_now = atual.get("dma_remapping_policy")
+                if (orig_dma is not None and dma_now is not None
+                        and dma_now != orig_dma):
+                    log(f"[IOMMU-GUARD] DMA Remapping do dispositivo "
+                        f"mudou: {_descrever_dma(orig_dma)} -> "
+                        f"{_descrever_dma(dma_now)}.", logging.WARNING)
+                    if tentar_reverter and is_admin():
+                        if _reverter_dma_remapping(
+                                adapter, snapshot, int(orig_dma)):
+                            log(f"[IOMMU-GUARD] Registro revertido para "
+                                f"{_descrever_dma(orig_dma)} "
+                                f"(efetivo apos re-enumeracao do "
+                                f"dispositivo).")
+
+                # 2) VBS / DeviceGuard do sistema
+                dg_now = (atual.get("device_guard") or {}).get(
+                    "VirtualizationBasedSecurityStatus")
+                if (orig_dg is not None and dg_now is not None
+                        and dg_now != orig_dg):
+                    log(f"[IOMMU-GUARD] VBS mudou: "
+                        f"{_descrever_vbs(orig_dg)} -> "
+                        f"{_descrever_vbs(dg_now)}. Mudancas de VBS "
+                        f"so tomam efeito apos reboot.",
+                        logging.WARNING)
+        except Exception as e:  # noqa: BLE001
+            LOGGER.debug("iommu_watchdog: %s", e)
+        STOP_EVENT.wait(intervalo)
+
+
+# ========================================================================
 # 10.6. DIAGNOSTICO (executado antes do AdaptiveKeepAlive)
 # ========================================================================
 def executar_diagnostico(args: argparse.Namespace, adapter: dict,
@@ -1522,6 +1760,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Disabled). Restaura o estado original ao sair. "
                         "Exige Administrador. NAO sobrepoe GPO/drivers "
                         "OEM; os avisos continuam valendo.")
+    g.add_argument("--watch-iommu", dest="watch_iommu", action="store_true",
+                   help="Monitora e tenta manter a politica de DMA "
+                        "Remapping do dispositivo PCIe no estado atual "
+                        "(ex.: Disabled). Reverte a chave de registro se "
+                        "algo tentar alterar. IOMMU em si e configurado "
+                        "em UEFI/BIOS e NAO pode ser bloqueado por "
+                        "programa em user space; o programa so alerta "
+                        "sobre mudancas de VBS.")
 
     p.add_argument("--version", action="version",
                    version=f"{APP_NAME} {APP_VERSION}")
@@ -1712,6 +1958,26 @@ def main(argv: list[str] | None = None) -> int:
     STATS["started_at"] = time.time()
     threads: list[threading.Thread] = []
     nic_snapshot: dict = {}
+    iommu_snapshot: dict = {}
+
+    # IOMMU WATCH (opcional): monitora/trava DMA Remapping do dispositivo
+    if args.watch_iommu:
+        iommu_snapshot = ler_estado_iommu(adapter["name"])
+        if iommu_snapshot:
+            imprimir_estado_iommu(adapter["name"], iommu_snapshot)
+            if not is_admin():
+                log("[IOMMU-GUARD] Sem Administrador: so monitorar "
+                    "mudancas, sem reverter.", logging.WARNING)
+            t_iommu = threading.Thread(
+                target=iommu_watchdog,
+                args=(adapter, iommu_snapshot),
+                kwargs={"tentar_reverter": is_admin()},
+                daemon=True, name="iommu-guard")
+            t_iommu.start()
+            threads.append(t_iommu)
+        else:
+            log("[IOMMU-GUARD] Nao consegui ler estado inicial. "
+                "Watch desabilitado.", logging.WARNING)
 
     # NIC LOCK (opcional): tenta impedir Windows de desligar/bloquear a NIC
     if args.lock_nic:

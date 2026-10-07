@@ -5,6 +5,14 @@ Mantém um adaptador Ethernet do Windows 11 ativo gerando tráfego sintético
 usuário. Inclui servidor HTTP fake embutido, watchdog para reconexão e
 suporte a múltiplos protocolos.
 
+**Documentação complementar:**
+
+- [`INSTALL.md`](INSTALL.md) — passo a passo da instalação (automática ou manual).
+- [`EXECUCAO.md`](EXECUCAO.md) — passo a passo da execução, flags, agendamento.
+- [`install.bat`](install.bat) — instalador automático (Python + Scapy + Npcap).
+- [`ethkeepalive.bat`](ethkeepalive.bat) — launcher com auto-elevação UAC.
+- [`ethkeepalive-listar.bat`](ethkeepalive-listar.bat) — atalho para listar adaptadores.
+
 > **Aviso:** o script gera tráfego para evitar que o adaptador fique
 > ocioso, mas **não impede** o Windows de desativar a placa por
 > políticas de economia de energia. Para garantir, desmarque
@@ -151,6 +159,7 @@ python ethkeepalive.py -d 2 --diagnostic
 | `--http-url <path>`        | Caminho usado nos HTTP GET/HEAD/POST (padrão `/`)               |
 | `--tcp-mode <modo>`        | `short` (padrão) \| `keep-alive` (reaproveita um socket)        |
 | `--lock-nic`               | Tenta impedir Windows de desativar/desligar a NIC enquanto roda |
+| `--watch-iommu`            | Monitora e tenta manter a política de DMA Remapping do dispositivo (atualmente Disabled) |
 
 Modos:
 
