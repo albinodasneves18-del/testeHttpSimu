@@ -47,6 +47,35 @@ Envio raw de pacotes (camada 2) exige privilégios elevados. Clique com o
 botão direito no `cmd` / `PowerShell` e escolha
 **"Executar como administrador"**, então navegue até a pasta do script.
 
+### 4b. Atalho via `ethkeepalive.bat`
+
+Para quem preferir **clique duplo**, use o arquivo `ethkeepalive.bat`
+(incluído no projeto). Ele:
+
+1. Pede elevação UAC automaticamente se não estiver como Administrador.
+2. Verifica se `python` está no PATH.
+3. Instala `scapy` se faltar.
+4. Avisa se o Npcap aparentemente não está presente.
+5. Executa o programa em uma janela de console e **pausa** no final
+   para você poder ler a saída.
+
+Sem argumentos, executa com os padrões recomendados:
+
+```bat
+python ethkeepalive.py --anti-idle --lock-nic
+```
+
+Com argumentos, repassa tudo:
+
+```bat
+ethkeepalive.bat --listar
+ethkeepalive.bat -d 2 --proto mixed
+ethkeepalive.bat -d 2 --keepalive-mode aggressive --lock-nic
+```
+
+Também há `ethkeepalive-listar.bat` para listar os adaptadores sem
+precisar de elevação.
+
 ---
 
 ## Uso rápido
@@ -121,6 +150,7 @@ python ethkeepalive.py -d 2 --diagnostic
 | `--http-host <host>`       | Header `Host` das requisições HTTP (padrão: `--target`)         |
 | `--http-url <path>`        | Caminho usado nos HTTP GET/HEAD/POST (padrão `/`)               |
 | `--tcp-mode <modo>`        | `short` (padrão) \| `keep-alive` (reaproveita um socket)        |
+| `--lock-nic`               | Tenta impedir Windows de desativar/desligar a NIC enquanto roda |
 
 Modos:
 
@@ -173,6 +203,10 @@ Modos:
 | `--anti-idle` como atalho de adaptativo + diagnóstico                |  OK    |
 | Aviso claro sobre gerenciamento de energia (sem alterar automaticamente) | OK |
 | Limite rígido de 1 conexão TCP simultânea (sem flood)                |  OK    |
+| **`--lock-nic`**: desativa `AllowComputerToTurnOffDevice` + `Enable-NetAdapter` + guardião | OK |
+| Snapshot do estado original e restauração automática ao sair         |  OK    |
+| `ethkeepalive.bat` com auto-elevação UAC, pip-install e checagem Npcap |  OK    |
+| `ethkeepalive-listar.bat` (lista adaptadores sem exigir elevação)    |  OK    |
 
 ---
 
@@ -291,6 +325,34 @@ desligue a NIC por economia de energia"** como problemas diferentes:
 - `SAFETY_MAX_PAYLOAD  = 2048 B` — payload HTTP é truncado.
 - `SAFETY_MAX_CONCURRENT = 1`   — no máximo uma conexão TCP ao mesmo tempo.
 - Sem flood, sem broadcast contínuo, todas as threads têm `sleep`.
+
+### `--lock-nic` — impedir desativação da NIC enquanto roda
+
+Ao passar `--lock-nic`, o programa:
+
+1. Lê o estado atual via `Get-NetAdapterPowerManagement` e `Get-NetAdapter`
+   e guarda um **snapshot**.
+2. Executa `Set-NetAdapterPowerManagement -AllowComputerToTurnOffDevice
+   Disabled -NoRestart` para impedir que o Windows desligue o dispositivo
+   para "economizar energia".
+3. Se a interface estiver `Disabled`, executa `Enable-NetAdapter -Confirm:$false`.
+4. Inicia uma thread guardiã (`nic_guard`) que a cada 10 s re-aplica o
+   lock se algo externo tiver desfeito.
+5. No encerramento (Ctrl+C, SIGTERM, fim do `main()`), **restaura o
+   estado original** salvo no snapshot.
+
+Pré-requisito: `--lock-nic` só funciona em Windows **como Administrador**.
+Fora disso, é ignorado com log.
+
+> **Honestidade sobre garantias:** este bloqueio reduz drasticamente a
+> chance do Windows desativar a NIC por economia de energia, mas **não
+> é absoluto**. GPO corporativas, drivers OEM customizados, Mobility
+> Center e políticas agressivas de bateria podem sobrepor
+> `Set-NetAdapterPowerManagement`. O programa logga quando detecta
+> reversão e tenta reaplicar, mas não há forma documentada de impedir
+> 100% o SO. Para hardening máximo, combine com a configuração manual
+> em *Gerenciador de Dispositivos → Propriedades da NIC → Gerenciamento
+> de energia* desmarcada e, se houver GPO, converse com a TI.
 
 ---
 

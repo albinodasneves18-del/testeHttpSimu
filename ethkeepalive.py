@@ -1160,6 +1160,157 @@ def watchdog_interface_adaptive(adapter_name: str,
 
 
 # ========================================================================
+# 10.55. NIC LOCK - tenta impedir que o Windows desative/bloqueie a NIC
+# ========================================================================
+# IMPORTANTE: isto exige Administrador e NAO substitui politicas de grupo
+# (GPO) nem drivers que ignorem Set-NetAdapterPowerManagement. O programa
+# salva o estado original no boot e RESTAURA ao encerrar (SIGINT/SIGTERM
+# ou excecao do main). Uma thread guardia reaplica o lock se algo externo
+# tentar desfazer durante a execucao.
+
+# Guarda do estado original para restauracao
+_NIC_SNAPSHOT: dict[str, Any] = {}
+_NIC_LOCK_LOCK = threading.Lock()
+
+
+def _ps_bool_arg(v: Any) -> str:
+    """Converte um valor PowerShell em 'Enabled'/'Disabled' para o cmdlet."""
+    s = str(v).strip().lower()
+    if s in ("enabled", "true", "1"):
+        return "Enabled"
+    if s in ("disabled", "false", "0"):
+        return "Disabled"
+    return "Disabled"
+
+
+def bloquear_nic(adapter_name: str) -> dict:
+    """
+    Tenta impedir que o Windows desligue/bloqueie o adaptador enquanto
+    o programa estiver rodando. Devolve snapshot do estado original.
+
+    Acoes:
+      - Set-NetAdapterPowerManagement -AllowComputerToTurnOffDevice Disabled
+      - Enable-NetAdapter se estiver Disabled (so se possivel)
+
+    NAO ha garantia absoluta: GPO, drivers OEM, politicas de bateria
+    (quando em modo de energia agressivo) e Mobility Center podem
+    sobrescrever. O programa reaplica em loop (nic_guard) e logga quando
+    detecta reversao.
+    """
+    snapshot: dict[str, Any] = {"name": adapter_name}
+    if not is_windows():
+        return snapshot
+
+    pm = obter_power_management(adapter_name)
+    if pm:
+        snapshot["pm"] = pm
+        allow = str(pm.get("AllowComputerToTurnOffDevice", "")).lower()
+        if allow in ("enabled", "true", "1"):
+            script = (
+                f"try {{ Set-NetAdapterPowerManagement -Name "
+                f"'{adapter_name}' "
+                f"-AllowComputerToTurnOffDevice Disabled "
+                f"-NoRestart -ErrorAction Stop; 'OK' }} catch "
+                f"{{ $_.Exception.Message }}"
+            )
+            out = _run_powershell(script).strip()
+            if out == "OK":
+                log(f"[NIC-LOCK] AllowComputerToTurnOffDevice=Disabled "
+                    f"em '{adapter_name}'.")
+                snapshot["pm_modified"] = True
+            else:
+                log(f"[NIC-LOCK] Falha ao alterar PowerManagement: {out}",
+                    logging.WARNING)
+
+    status = _status_adaptador(adapter_name)
+    snapshot["status"] = status
+    if status and status.lower() == "disabled":
+        script = (
+            f"try {{ Enable-NetAdapter -Name '{adapter_name}' "
+            f"-Confirm:$false -ErrorAction Stop; 'OK' }} catch "
+            f"{{ $_.Exception.Message }}"
+        )
+        out = _run_powershell(script).strip()
+        if out == "OK":
+            log(f"[NIC-LOCK] Reativado '{adapter_name}' (estava Disabled).")
+            snapshot["enabled_by_lock"] = True
+        else:
+            log(f"[NIC-LOCK] Falha ao reativar: {out}", logging.WARNING)
+
+    return snapshot
+
+
+def restaurar_nic(snapshot: dict) -> None:
+    """Restaura o estado da NIC capturado por bloquear_nic()."""
+    if not snapshot:
+        return
+    name = snapshot.get("name")
+    if not name or not is_windows():
+        return
+
+    with _NIC_LOCK_LOCK:
+        try:
+            if snapshot.get("pm_modified") and snapshot.get("pm"):
+                allow = _ps_bool_arg(
+                    snapshot["pm"].get("AllowComputerToTurnOffDevice", "Disabled"))
+                script = (
+                    f"try {{ Set-NetAdapterPowerManagement -Name '{name}' "
+                    f"-AllowComputerToTurnOffDevice {allow} -NoRestart "
+                    f"-ErrorAction Stop; 'OK' }} catch "
+                    f"{{ $_.Exception.Message }}"
+                )
+                out = _run_powershell(script).strip()
+                if out == "OK":
+                    log(f"[NIC-LOCK] Estado original restaurado em '{name}' "
+                        f"(AllowComputerToTurnOffDevice={allow}).")
+                else:
+                    log(f"[NIC-LOCK] Falha ao restaurar PowerManagement: "
+                        f"{out}", logging.WARNING)
+        except Exception as e:  # noqa: BLE001
+            log(f"[NIC-LOCK] Erro na restauracao: {e}", logging.WARNING)
+
+
+def nic_guard(adapter_name: str, snapshot: dict,
+              intervalo: float = 10.0) -> None:
+    """
+    Thread guardia: periodicamente verifica se o lock foi desfeito
+    (energia ou interface desabilitada) e reaplica.
+    """
+    while not STOP_EVENT.is_set():
+        try:
+            with _NIC_LOCK_LOCK:
+                # 1) Reativa se foi Disabled
+                status = _status_adaptador(adapter_name)
+                if status and status.lower() == "disabled":
+                    log(f"[NIC-GUARD] '{adapter_name}' foi Disabled "
+                        f"externamente. Re-habilitando.",
+                        logging.WARNING)
+                    _run_powershell(
+                        f"try {{ Enable-NetAdapter -Name '{adapter_name}' "
+                        f"-Confirm:$false -ErrorAction Stop }} catch {{}}"
+                    )
+                # 2) Re-aplica politica de energia
+                pm = obter_power_management(adapter_name)
+                if pm:
+                    allow = str(pm.get("AllowComputerToTurnOffDevice",
+                                       "")).lower()
+                    if allow in ("enabled", "true", "1"):
+                        log(f"[NIC-GUARD] AllowComputerToTurnOffDevice "
+                            f"voltou a Enabled. Re-desabilitando.",
+                            logging.WARNING)
+                        _run_powershell(
+                            f"try {{ Set-NetAdapterPowerManagement -Name "
+                            f"'{adapter_name}' "
+                            f"-AllowComputerToTurnOffDevice Disabled "
+                            f"-NoRestart -ErrorAction Stop }} catch {{}}"
+                        )
+                        snapshot["pm_modified"] = True
+        except Exception as e:  # noqa: BLE001
+            LOGGER.debug("nic_guard erro: %s", e)
+        STOP_EVENT.wait(intervalo)
+
+
+# ========================================================================
 # 10.6. DIAGNOSTICO (executado antes do AdaptiveKeepAlive)
 # ========================================================================
 def executar_diagnostico(args: argparse.Namespace, adapter: dict,
@@ -1364,6 +1515,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    choices=["short", "keep-alive"], default="short",
                    help="Reaproveitar socket TCP entre ciclos "
                         "(padrao: short)")
+    g.add_argument("--lock-nic", dest="lock_nic", action="store_true",
+                   help="Tenta impedir que o Windows desative/desligue "
+                        "a NIC enquanto o programa roda (desativa "
+                        "AllowComputerToTurnOffDevice e re-habilita se "
+                        "Disabled). Restaura o estado original ao sair. "
+                        "Exige Administrador. NAO sobrepoe GPO/drivers "
+                        "OEM; os avisos continuam valendo.")
 
     p.add_argument("--version", action="version",
                    version=f"{APP_NAME} {APP_VERSION}")
@@ -1553,6 +1711,27 @@ def main(argv: list[str] | None = None) -> int:
 
     STATS["started_at"] = time.time()
     threads: list[threading.Thread] = []
+    nic_snapshot: dict = {}
+
+    # NIC LOCK (opcional): tenta impedir Windows de desligar/bloquear a NIC
+    if args.lock_nic:
+        if not is_windows():
+            log("--lock-nic ignorado: nao estamos em Windows.",
+                logging.WARNING)
+        elif not is_admin():
+            log("--lock-nic ignorado: precisa de Administrador para "
+                "alterar PowerManagement/Enable-NetAdapter.",
+                logging.ERROR)
+        else:
+            log("[NIC-LOCK] Tentando bloquear desativacao da NIC "
+                "enquanto o programa roda...")
+            nic_snapshot = bloquear_nic(adapter["name"])
+            t_guard = threading.Thread(
+                target=nic_guard,
+                args=(adapter["name"], nic_snapshot),
+                daemon=True, name="nic-guard")
+            t_guard.start()
+            threads.append(t_guard)
 
     # Servidor HTTP fake (compartilhado por ambos os modos)
     if not args.sem_http:
@@ -1603,6 +1782,8 @@ def main(argv: list[str] | None = None) -> int:
         STOP_EVENT.set()
         for t in threads:
             t.join(timeout=3.0)
+        if nic_snapshot:
+            restaurar_nic(nic_snapshot)
         _resumo_estatisticas()
     return 0
 
